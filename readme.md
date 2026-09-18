@@ -3,6 +3,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-gold.svg)](LICENSE)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Documentation: v1.0](https://img.shields.io/badge/Documentation-Complete%20Beginner's%20Guide%20v1.0-gold.svg)](DOCUMENTATION.md)
 [![Vigorous Tests](https://img.shields.io/badge/Vigorous%20Tests-201%2F201%20Passed%20(100%25)-brightgreen.svg)](tests/test_arc_vigorous.py)
 [![Direct3D 11 RHI](https://img.shields.io/badge/Hardware%20Acceleration-Direct3D%2011%20%2F%20VRAM-cyan.svg)](core/gpu_accelerator.py)
 [![Privacy](https://img.shields.io/badge/Privacy-Local%20First%20%2F%20Zero%20Leak-purple.svg)](security/)
@@ -11,10 +12,13 @@
 
 ARC is architected with **complete self-awareness**: it introspects its live capabilities, system health, active hardware, and memory records in real time to deliver deterministic, verified responses.
 
+> 📚 **New to ARC?** Read the [**Complete Documentation v1.0 for Absolute Beginners**](DOCUMENTATION.md) for a comprehensive walkthrough of every single file, command, and subsystem.
+
 ---
 
 ## 📑 Table of Contents
 
+- [📖 Complete Beginner Documentation v1.0](DOCUMENTATION.md)
 - [✨ Core Capabilities](#-core-capabilities)
 - [🏗️ System Architecture](#️-system-architecture)
 - [⚡ Sub-Millisecond Low Latency Engine](#-sub-millisecond-low-latency-engine)
