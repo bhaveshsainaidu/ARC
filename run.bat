@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-title JARVIS
+title ARC
 
 cd /d "%~dp0"
 
@@ -16,11 +16,11 @@ if exist ".venv\Scripts\python.exe" (
     set "PY_EXE=python"
 )
 
-:: Run JARVIS
+:: Run ARC
 "%PY_EXE%" main.py %*
 
 if %ERRORLEVEL% neq 0 (
     echo.
-    echo [JARVIS] Process exited with error code %ERRORLEVEL%.
+    echo [ARC] Process exited with error code %ERRORLEVEL%.
     pause
 )

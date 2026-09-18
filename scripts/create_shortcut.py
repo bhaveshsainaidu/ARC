@@ -21,7 +21,7 @@ if sys.platform == "windows" or os.name == "nt":
         pass
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-ICON_FILE = PROJECT_DIR / "config" / "jarvis.ico"
+ICON_FILE = PROJECT_DIR / "config" / "arc.ico"
 RUN_BAT = PROJECT_DIR / "run.bat"
 MAIN_PY = PROJECT_DIR / "main.py"
 
