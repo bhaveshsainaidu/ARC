@@ -511,3 +511,33 @@ def test_gr40_after_1000_events_accuracy_unchanged():
 
     accuracy = (correct / total) * 100.0
     assert accuracy == 100.0, f"Accuracy {accuracy:.1f}% dropped below 100%"
+
+
+def test_gr41_controller_restart_cycle():
+    """GR41 — Controller can start, stop, and restart without RuntimeError."""
+    ctrl = GestureController.get_instance()
+    # Ensure clean state
+    if ctrl.is_running():
+        ctrl.stop()
+    ok1, _ = ctrl.start()
+    assert ok1 is True
+    assert ctrl.is_running() is True
+    time.sleep(0.05)
+    ok2, _ = ctrl.stop()
+    assert ok2 is True
+    assert ctrl.is_running() is False
+    # Restart cycle must succeed cleanly
+    ok3, _ = ctrl.start()
+    assert ok3 is True
+    assert ctrl.is_running() is True
+    ctrl.stop()
+    assert ctrl.is_running() is False
+
+
+def test_gr42_snapshot_jpeg_retrieval():
+    """GR42 — get_snapshot_jpeg returns valid data or None safely."""
+    ctrl = GestureController.get_instance()
+    # With engine stopped, should return None or cached
+    snap = ctrl.get_snapshot_jpeg()
+    assert snap is None or isinstance(snap, bytes)
+

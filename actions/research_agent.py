@@ -60,28 +60,30 @@ def decompose_query(topic: str) -> list[str]:
         ]
 
     try:
-        from google import genai as _genai
-        api_key = _get_api_key()
-        if api_key:
-            client = _genai.Client(api_key=api_key)
-            prompt = (
-                f"Decompose the following technical/research topic into exactly 5 distinct sub-questions for research:\n"
-                f"Topic: {clean_topic}\n"
-                f"Provide exactly 5 numbered questions covering fundamentals, architectures, benchmarks, limitations, and future work. "
-                f"Output only the 5 questions, one per line."
-            )
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-            )
-            lines = [line.strip() for line in (resp.text or "").split("\n") if line.strip()]
-            sub_q = []
-            for line in lines:
-                cleaned = re.sub(r"^(\d+[\.\)]|\-|\*)\s*", "", line).strip()
-                if cleaned and len(cleaned) > 5:
-                    sub_q.append(cleaned)
-            if len(sub_q) >= 5:
-                return sub_q[:5]
+        import os
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            from google import genai as _genai
+            api_key = _get_api_key()
+            if api_key:
+                client = _genai.Client(api_key=api_key)
+                prompt = (
+                    f"Decompose the following technical/research topic into exactly 5 distinct sub-questions for research:\n"
+                    f"Topic: {clean_topic}\n"
+                    f"Provide exactly 5 numbered questions covering fundamentals, architectures, benchmarks, limitations, and future work. "
+                    f"Output only the 5 questions, one per line."
+                )
+                resp = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                )
+                lines = [line.strip() for line in (resp.text or "").split("\n") if line.strip()]
+                sub_q = []
+                for line in lines:
+                    cleaned = re.sub(r"^(\d+[\.\)]|\-|\*)\s*", "", line).strip()
+                    if cleaned and len(cleaned) > 5:
+                        sub_q.append(cleaned)
+                if len(sub_q) >= 5:
+                    return sub_q[:5]
     except Exception:
         pass
 

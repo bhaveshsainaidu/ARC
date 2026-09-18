@@ -3861,23 +3861,37 @@ class RemoteKeyOverlay(QWidget):
 
     def mark_connected(self) -> None:
         """Call from any thread when a phone successfully connects."""
-        self._ctimer.stop()
-        self._key_lbl.setText("CONNECTED")
-        self._key_lbl.setStyleSheet(f"""
-            color: {C.GREEN};
-            background: rgba(34,197,94,0.08);
-            border: 2px solid rgba(34,197,94,0.4);
-            border-radius: 8px;
-            padding: 6px 4px;
-            letter-spacing: 4px;
-        """)
-        self._qr_label.setText("✓")
-        self._qr_label.setFont(QFont("Courier New", 54, QFont.Weight.Bold))
-        self._qr_label.setStyleSheet(
-            "color: #00ff88; background: #001a0d; border-radius: 10px;"
-        )
-        self._timer_lbl.setText("Phone connected — ARC ready")
-        self._timer_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
+        try:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, self._apply_connected)
+        except Exception:
+            self._apply_connected()
+
+    def _apply_connected(self) -> None:
+        try:
+            if hasattr(self, "_ctimer") and self._ctimer is not None:
+                self._ctimer.stop()
+            if hasattr(self, "_key_lbl") and self._key_lbl is not None:
+                self._key_lbl.setText("CONNECTED")
+                self._key_lbl.setStyleSheet(f"""
+                    color: {C.GREEN};
+                    background: rgba(34,197,94,0.08);
+                    border: 2px solid rgba(34,197,94,0.4);
+                    border-radius: 8px;
+                    padding: 6px 4px;
+                    letter-spacing: 4px;
+                """)
+            if hasattr(self, "_qr_label") and self._qr_label is not None:
+                self._qr_label.setText("✓")
+                self._qr_label.setFont(QFont("Courier New", 54, QFont.Weight.Bold))
+                self._qr_label.setStyleSheet(
+                    "color: #00ff88; background: #001a0d; border-radius: 10px;"
+                )
+            if hasattr(self, "_timer_lbl") and self._timer_lbl is not None:
+                self._timer_lbl.setText("Phone connected — ARC ready")
+                self._timer_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
+        except Exception as e:
+            print(f"[RemoteOverlay] apply_connected note: {e}")
 
     def _refresh_key(self):
         if self._on_new_key:
@@ -5498,8 +5512,15 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
     def notify_phone_connected(self) -> None:
-        if self._remote_overlay and self._remote_overlay.isVisible():
-            self._remote_overlay.mark_connected()
+        try:
+            from PyQt6.QtCore import QTimer
+            def _dispatch():
+                if getattr(self, "_remote_overlay", None) and self._remote_overlay.isVisible():
+                    self._remote_overlay.mark_connected()
+            QTimer.singleShot(0, _dispatch)
+        except Exception:
+            if getattr(self, "_remote_overlay", None):
+                self._remote_overlay.mark_connected()
 
     def _open_remote(self):
         if not self.on_remote_clicked:

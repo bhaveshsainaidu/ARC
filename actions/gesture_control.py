@@ -417,11 +417,19 @@ class GestureEngine(threading.Thread):
         self.on_gesture_callback: Optional[Callable[[str], None]] = None
         self.on_frame_callback: Optional[Callable[[bytes], None]] = None
         self.on_stats_callback: Optional[Callable[[dict], None]] = None
+        self._latest_jpeg: Optional[bytes] = None
+        self._last_frame: Any = None
+        self._has_started = False
+
+    def get_snapshot_jpeg(self) -> Optional[bytes]:
+        """Returns the latest pre-encoded 30 FPS JPEG frame without re-querying camera."""
+        return self._latest_jpeg
 
     def start_engine(self) -> Tuple[bool, str]:
         if self.running and self.is_alive():
             return True, "GestureEngine is already active."
         self.running = True
+        self._has_started = True
         self.start()
         return True, "GestureEngine active at 30 FPS."
 
@@ -649,11 +657,15 @@ class GestureEngine(threading.Thread):
         except Exception:
             pass
 
-        # Callback for image stream
-        if self.on_frame_callback and frame is not None and _CV2_AVAILABLE:
+        self._last_frame = frame
+
+        # Encode and cache latest JPEG frame for callbacks and remote snapshot endpoint
+        if frame is not None and _CV2_AVAILABLE:
             try:
                 _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                self.on_frame_callback(buf.tobytes())
+                self._latest_jpeg = buf.tobytes()
+                if self.on_frame_callback:
+                    self.on_frame_callback(self._latest_jpeg)
             except Exception:
                 pass
 
@@ -801,6 +813,7 @@ class GestureController:
         self.engine = GestureEngine(player)
         self.on_gesture_callback: Optional[Callable[[str], None]] = None
         self.on_frame_callback: Optional[Callable[[bytes], None]] = None
+        self.on_stats_callback: Optional[Callable[[dict], None]] = None
 
     @classmethod
     def get_instance(cls, player=None) -> "GestureController":
@@ -823,16 +836,39 @@ class GestureController:
     def history(self) -> list[dict]:
         return self.engine.history
 
+    def get_snapshot_jpeg(self) -> Optional[bytes]:
+        """Return the latest frame JPEG from the engine, or None."""
+        if self.engine:
+            return self.engine.get_snapshot_jpeg()
+        return None
+
     def start(self) -> Tuple[bool, str]:
         if self.is_running():
             return True, "Gesture control is already active."
         if not _CV2_AVAILABLE:
             return False, "OpenCV (cv2) is not installed."
 
-        if self.on_gesture_callback:
-            self.engine.on_gesture_callback = self.on_gesture_callback
-        if self.on_frame_callback:
-            self.engine.on_frame_callback = self.on_frame_callback
+        # If engine was previously started, threading.Thread cannot be restarted.
+        # Instantiate a fresh GestureEngine preserving camera settings, callbacks & history.
+        if getattr(self.engine, "_has_started", False) or (getattr(self.engine, "ident", None) is not None and not self.engine.is_alive()):
+            prev = self.engine
+            self.engine = GestureEngine(self.player)
+            self.engine.camera_enabled = prev.camera_enabled
+            self.engine.flip_horizontal = prev.flip_horizontal
+            self.engine.brightness_offset = prev.brightness_offset
+            self.engine.on_gesture_callback = self.on_gesture_callback or prev.on_gesture_callback
+            self.engine.on_frame_callback = self.on_frame_callback or prev.on_frame_callback
+            self.engine.on_stats_callback = self.on_stats_callback or prev.on_stats_callback
+            self.engine.history = list(prev.history)
+            self.engine._latest_jpeg = prev._latest_jpeg
+            self.engine._last_frame = prev._last_frame
+        else:
+            if self.on_gesture_callback:
+                self.engine.on_gesture_callback = self.on_gesture_callback
+            if self.on_frame_callback:
+                self.engine.on_frame_callback = self.on_frame_callback
+            if self.on_stats_callback:
+                self.engine.on_stats_callback = self.on_stats_callback
 
         self.engine.start_engine()
         self._notify_hud(True, "Gesture Tracking Active")

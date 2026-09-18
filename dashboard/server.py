@@ -910,27 +910,47 @@ class DashboardServer:
 
         @app.get("/api/camera/snapshot")
         async def camera_snapshot_ep(req: Request):
+            from fastapi.responses import Response
+
+            # 1. Primary path: If GestureEngine is running at 30 FPS, return its live pre-encoded frame
+            try:
+                from actions.gesture_control import GestureController
+                ctrl = GestureController.get_instance()
+                if ctrl.is_running():
+                    jpeg = ctrl.get_snapshot_jpeg()
+                    if jpeg:
+                        return Response(content=jpeg, media_type="image/jpeg")
+            except Exception:
+                pass
+
+            # 2. Standalone capture: If engine is not running, query active camera without OBSensor fallback
             try:
                 import cv2
                 from core.device_service import get_active_camera_index
                 cam_idx = get_active_camera_index()
                 backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
                 cap = cv2.VideoCapture(cam_idx, backend)
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(0)
-                if not cap.isOpened():
-                    from fastapi.responses import Response
-                    return Response(content=b"", media_type="image/jpeg", status_code=503)
-                ret, frame = cap.read()
-                cap.release()
-                if ret and frame is not None:
-                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                    from fastapi.responses import Response
-                    return Response(content=buf.tobytes(), media_type="image/jpeg")
+                if not cap.isOpened() and backend != cv2.CAP_ANY:
+                    cap = cv2.VideoCapture(cam_idx)
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    cap.release()
+                    if ret and frame is not None:
+                        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                        return Response(content=buf.tobytes(), media_type="image/jpeg")
             except Exception:
                 pass
-            from fastapi.responses import Response
-            return Response(content=b"", media_type="image/jpeg", status_code=500)
+
+            # 3. Fallback: Return cached JPEG if previously captured
+            try:
+                from actions.gesture_control import GestureController
+                ctrl = GestureController.get_instance()
+                if ctrl and ctrl.engine and getattr(ctrl.engine, "_latest_jpeg", None):
+                    return Response(content=ctrl.engine._latest_jpeg, media_type="image/jpeg")
+            except Exception:
+                pass
+
+            return Response(content=b"", media_type="image/jpeg", status_code=503)
 
         @app.websocket("/ws")
         async def ws_ep(websocket: WebSocket, token: str = ""):

@@ -34,6 +34,15 @@ def _capture_frame_from_active_camera() -> Optional[Any]:
     """Captures a clean frame from the active camera (Index 1 OsmoAction4 / Index 0)."""
     if not _CV2:
         return None
+
+    try:
+        from actions.gesture_control import GestureController
+        ctrl = GestureController.get_instance()
+        if ctrl.is_running() and getattr(ctrl.engine, "_last_frame", None) is not None:
+            return ctrl.engine._last_frame.copy()
+    except Exception:
+        pass
+
     cam_idx = get_active_camera_index()
     backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
     cap = cv2.VideoCapture(cam_idx, backend)
