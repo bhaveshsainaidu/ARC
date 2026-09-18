@@ -5307,43 +5307,23 @@ class MainWindow(QMainWindow):
     def _toggle_drawer(self, checked: bool):
         if not hasattr(self, '_quick_drawer'):
             return
-        if not hasattr(self, '_drawer_anim'):
-            self._drawer_anim = QPropertyAnimation(self._quick_drawer, b"maximumHeight")
-            self._drawer_anim.setDuration(200)
-            self._drawer_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-
         if checked:
             self._position_quick_drawer()
             self._quick_drawer.show()
             self._quick_drawer.raise_()
-            target_h = max(440, self._quick_drawer.sizeHint().height())
-            self._drawer_anim.stop()
-            self._drawer_anim.setStartValue(0)
-            self._drawer_anim.setEndValue(target_h)
-            self._drawer_anim.start()
-
-            # Lazy load data with 30s cache offloaded to HeavyWorker
-            now = time.time()
-            if not hasattr(self, '_drawer_cached_time') or (now - self._drawer_cached_time > 30.0):
-                self._drawer_cached_time = now
-                worker = HeavyWorker(self._refresh_wake_btns)
-                QThreadPool.globalInstance().start(worker)
-        else:
-            self._drawer_anim.stop()
-            self._drawer_anim.setStartValue(self._quick_drawer.height())
-            self._drawer_anim.setEndValue(0)
             try:
-                self._drawer_anim.finished.disconnect()
+                self._refresh_wake_btns()
             except Exception:
                 pass
-            self._drawer_anim.finished.connect(self._quick_drawer.hide)
-            self._drawer_anim.start()
+        else:
+            self._quick_drawer.hide()
 
     def _position_quick_drawer(self):
         if not hasattr(self, '_quick_drawer'):
             return
         _W = 220
         self._quick_drawer.setFixedWidth(_W)
+        self._quick_drawer.setMaximumHeight(16777215)
         self._quick_drawer.adjustSize()
         self._quick_drawer.setGeometry(12, 54, _W, self._quick_drawer.sizeHint().height())
 
