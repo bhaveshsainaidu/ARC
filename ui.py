@@ -29,18 +29,41 @@ else:
 
 from PyQt6.QtCore import (
     QEasingCurve, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
-    QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, QUrl, pyqtSignal,
+    QPropertyAnimation, QRect, QRectF, QRunnable, QSize, Qt, QThreadPool, QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
+    QFontDatabase, QImage, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
+    QListWidget, QListWidgetItem, QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QStackedWidget, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
 )
+
+class WorkerSignals(QObject):
+    result = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+
+class HeavyWorker(QRunnable):
+    """Offloads heavy computation, file I/O, and blocking calls from the UI thread."""
+
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            res = self.fn(*self.args, **self.kwargs)
+            self.signals.result.emit(res)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
 
 try:
     from core.gpu_accelerator import GPUAccelerator
@@ -260,8 +283,15 @@ class _SysMetrics:
         self._nv_unix   = None         # cached (lib, dev) for Linux/macOS NVML
         self._wmi_conn  = None         # cached WMI connection (creating one is slow)
         self._wmi_ok    = None         # None=untested, False=unavailable here
+        self.boot_time  = time.time()
+        try:
+            self.boot_time = psutil.boot_time()
+        except Exception:
+            pass
+        self.proc_count = 0
         t = threading.Thread(target=self._loop, daemon=True)
         t.start()
+
 
     def _loop(self):
         while self._running:
@@ -274,6 +304,11 @@ class _SysMetrics:
     def _update(self):
         cpu = psutil.cpu_percent(interval=None)
         mem = psutil.virtual_memory().percent
+        try:
+            self.proc_count = len(psutil.pids())
+        except Exception:
+            pass
+
 
         nc  = psutil.net_io_counters()
         now = time.time()
@@ -412,7 +447,10 @@ class _SysMetrics:
                 "vram_pct": getattr(self, "vram_pct", 0.0),
                 "vram_used_mb": getattr(self, "vram_used_mb", 0.0),
                 "vram_total_mb": getattr(self, "vram_total_mb", 0.0),
+                "boot_time": getattr(self, "boot_time", time.time()),
+                "proc_count": getattr(self, "proc_count", 0),
             }
+
 
 
 _metrics = _SysMetrics()
@@ -497,9 +535,29 @@ class HudCanvas(QWidget):
         self._base_scale = 1.0    # slow "breathing" target; amp is added per-frame
         self._base_halo  = 55.0
 
+        # HUD Gesture Feedback state
+        self._gesture_banner_text: Optional[str] = None
+        self._gesture_banner_start: float = 0.0
+        self._gesture_pulse_anim: float = 0.0
+
         self._tmr = QTimer(self)
+        self._tmr.setTimerType(Qt.TimerType.PreciseTimer)
         self._tmr.timeout.connect(self._step)
-        self._tmr.start(33)
+        self._tmr.start(16)  # Dedicated 60 FPS sphere timer
+
+    def trigger_gesture_feedback(self, gesture_name: str) -> None:
+        """Trigger HUD gesture feedback banner and sphere pulse."""
+        try:
+            from actions.gesture_control import GESTURE_ICONS
+            icon = GESTURE_ICONS.get(gesture_name, "🖐")
+        except Exception:
+            icon = "🖐"
+        self._gesture_banner_text = f"{icon} GESTURE: {str(gesture_name).replace('_', ' ')}"
+        self._gesture_banner_start = time.time()
+        self._gesture_pulse_anim = 1.0
+        self._pulses.append(0.0)
+        self.update()
+
 
     def set_threat_level(self, level: str) -> None:
         """Update threat level for center visualizer."""
@@ -706,12 +764,18 @@ class HudCanvas(QWidget):
         else:
             _blinked = False
 
+        if self._gesture_pulse_anim > 0.01:
+            self._scale += self._gesture_pulse_anim * 0.08
+            self._gesture_pulse_anim *= 0.88
+
         self._paint_tick = (self._paint_tick + 1) % 3
         active = (self.speaking or amp > 0.02
                   or self.state in ("THINKING", "PROCESSING")
-                  or len(self._sparks) > 0)
+                  or len(self._sparks) > 0
+                  or self._gesture_banner_text is not None)
         if active or _blinked or self._paint_tick == 0:
             self.update()
+
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -999,7 +1063,27 @@ class HudCanvas(QWidget):
                     cl = qcol(C.BORDER_B)
             p.fillRect(QRectF(wx0 + i * bw, wy + 20 - hgt, bw - 1, hgt), cl)
 
+        # ── Gesture Feedback Banner (Gold, 0.8s: 0.1s in + 0.4s hold + 0.3s out) ──
+        if self._gesture_banner_text:
+            elapsed = time.time() - self._gesture_banner_start
+            if elapsed < 0.8:
+                if elapsed < 0.1:
+                    alpha = int(255 * (elapsed / 0.1))
+                elif elapsed < 0.5:
+                    alpha = 255
+                else:
+                    alpha = int(255 * (1.0 - (elapsed - 0.5) / 0.3))
+                alpha = max(0, min(255, alpha))
+
+                p.setFont(QFont("Courier New", 13, QFont.Weight.Bold))
+                p.setPen(QColor(255, 215, 0, alpha))
+                text_rect = QRectF(cx - 240, cy + 30, 480, 40)
+                p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, self._gesture_banner_text)
+            else:
+                self._gesture_banner_text = None
+
         p.end()   # end deterministically so the backing store never flushes an active painter
+
 
 class MetricBar(QWidget):
 
@@ -2066,8 +2150,376 @@ class _HudOverlay(QWidget):
         super().closeEvent(e)
 
 
+class GestureGuideOverlay(_HudOverlay):
+    """Floating HUD overlay displaying all 20 ARC gesture commands with icons."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            GestureGuideOverlay {{
+                background: rgba(0, 8, 14, 248);
+                border: 1px solid {C.PRI_DIM};
+                border-radius: 8px;
+            }}
+        """)
+        self.setFixedWidth(560)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 14)
+        lay.setSpacing(6)
+
+        hdr = QHBoxLayout()
+        title = QLabel("◈  GESTURE REFERENCE GUIDE (20 GESTURES)")
+        title.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        hdr.addWidget(title)
+        hdr.addStretch()
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        close_btn.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: 1px solid {C.BORDER}; border-radius: 3px;")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(self.hide)
+        hdr.addWidget(close_btn)
+        lay.addLayout(hdr)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        lay.addWidget(sep)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFixedHeight(380)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        inner = QWidget()
+        ilay = QVBoxLayout(inner)
+        ilay.setContentsMargins(4, 4, 4, 4)
+        ilay.setSpacing(5)
+
+        try:
+            from actions.gesture_control import GESTURES, GESTURE_ICONS
+        except Exception:
+            GESTURES, GESTURE_ICONS = {}, {}
+
+        for idx, (name, desc) in enumerate(GESTURES.items(), 1):
+            icon = GESTURE_ICONS.get(name, "🖐")
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            num_lbl = QLabel(f"G{idx:02d}")
+            num_lbl.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            num_lbl.setFixedWidth(28)
+            num_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
+            row.addWidget(num_lbl)
+
+            g_lbl = QLabel(f"{icon}  {name.replace('_', ' ')}")
+            g_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            g_lbl.setFixedWidth(210)
+            g_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
+            row.addWidget(g_lbl)
+
+            d_lbl = QLabel(f"→  {desc}")
+            d_lbl.setFont(QFont("Courier New", 8))
+            d_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            row.addWidget(d_lbl, 1)
+
+            ilay.addLayout(row)
+
+        scroll.setWidget(inner)
+        lay.addWidget(scroll)
+        self.adjustSize()
+
+
+class CameraConsolePanel(QWidget):
+    """
+    Reinforced Camera Console Panel with 320x240 live feed, landmark overlay,
+    animated confidence bar, 8-frame progress bar, hold circle, controls, and history log.
+    """
+
+    def __init__(self, main_win=None, parent=None):
+        super().__init__(parent)
+        self.main_win = main_win
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            CameraConsolePanel {{
+                background: {C.BG};
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(6)
+
+        # ── Header: ● CAMERA CONSOLE   [● REC]   [🔍 AI SCAN]   [✕ CLOSE] ───
+        hdr = QHBoxLayout()
+        hdr.setSpacing(8)
+
+        title = QLabel("● CAMERA CONSOLE")
+        title.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        hdr.addWidget(title)
+
+        self._rec_pill = QLabel("● REC")
+        self._rec_pill.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._rec_pill.setStyleSheet(f"color: {C.RED}; background: #220000; border: 1px solid {C.RED}; border-radius: 3px; padding: 1px 6px;")
+        hdr.addWidget(self._rec_pill)
+
+        hdr.addStretch()
+
+        self._cam_combo = QComboBox()
+        self._cam_combo.setFont(QFont("Courier New", 7))
+        self._cam_combo.setFixedHeight(24)
+        self._cam_combo.setStyleSheet(f"""
+            QComboBox {{
+                background: {C.PANEL2}; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 6px;
+            }}
+        """)
+        hdr.addWidget(self._cam_combo)
+
+        if self.main_win and hasattr(self.main_win, "_on_ai_vision_scan"):
+            scan_btn = QPushButton("🔍 AI SCAN")
+            scan_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            scan_btn.setFixedHeight(24)
+            scan_btn.setStyleSheet(f"background: {C.PANEL2}; color: {C.ACC}; border: 1px solid {C.ACC}; border-radius: 3px; padding: 0 6px;")
+            scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            scan_btn.clicked.connect(self.main_win._on_ai_vision_scan)
+            hdr.addWidget(scan_btn)
+
+        close_btn = QPushButton("✕ CLOSE")
+        close_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        close_btn.setFixedHeight(24)
+        close_btn.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: 1px solid {C.BORDER}; border-radius: 3px; padding: 0 6px;")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        if self.main_win and hasattr(self.main_win, "stop_camera_stream"):
+            close_btn.clicked.connect(self.main_win.stop_camera_stream)
+        hdr.addWidget(close_btn)
+
+        lay.addLayout(hdr)
+
+        # ── Controls Ribbon: [TOGGLE] [FLIP] [BRIGHTNESS +/-] [GESTURE GUIDE] ───
+        ctrl_bar = QHBoxLayout()
+        ctrl_bar.setSpacing(6)
+
+        self._toggle_btn = QPushButton("📷 TOGGLE")
+        self._toggle_btn.setFont(QFont("Courier New", 7))
+        self._toggle_btn.setFixedHeight(22)
+        self._toggle_btn.setStyleSheet(f"background: {C.PANEL}; color: {C.PRI}; border: 1px solid {C.BORDER}; border-radius: 2px;")
+        self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle_btn.clicked.connect(self._on_toggle_camera)
+        ctrl_bar.addWidget(self._toggle_btn)
+
+        self._flip_btn = QPushButton("🪞 FLIP")
+        self._flip_btn.setFont(QFont("Courier New", 7))
+        self._flip_btn.setFixedHeight(22)
+        self._flip_btn.setStyleSheet(f"background: {C.PANEL}; color: {C.TEXT_MED}; border: 1px solid {C.BORDER}; border-radius: 2px;")
+        self._flip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._flip_btn.clicked.connect(self._on_flip_camera)
+        ctrl_bar.addWidget(self._flip_btn)
+
+        self._bright_down = QPushButton("🔅 -")
+        self._bright_down.setFixedSize(32, 22)
+        self._bright_down.setFont(QFont("Courier New", 7))
+        self._bright_down.setStyleSheet(f"background: {C.PANEL}; color: {C.TEXT_MED}; border: 1px solid {C.BORDER}; border-radius: 2px;")
+        self._bright_down.clicked.connect(lambda: self._adjust_brightness(-10))
+        ctrl_bar.addWidget(self._bright_down)
+
+        self._bright_up = QPushButton("🔆 +")
+        self._bright_up.setFixedSize(32, 22)
+        self._bright_up.setFont(QFont("Courier New", 7))
+        self._bright_up.setStyleSheet(f"background: {C.PANEL}; color: {C.TEXT_MED}; border: 1px solid {C.BORDER}; border-radius: 2px;")
+        self._bright_up.clicked.connect(lambda: self._adjust_brightness(10))
+        ctrl_bar.addWidget(self._bright_up)
+
+        self._gesture_btn = QPushButton("🖐 GESTURES: ON")
+        self._gesture_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._gesture_btn.setFixedHeight(22)
+        self._gesture_btn.setStyleSheet(f"background: {C.PANEL}; color: {C.GREEN}; border: 1px solid {C.GREEN}; border-radius: 2px;")
+        if self.main_win and hasattr(self.main_win, "_toggle_gesture_control"):
+            self._gesture_btn.clicked.connect(self.main_win._toggle_gesture_control)
+        ctrl_bar.addWidget(self._gesture_btn)
+
+        guide_btn = QPushButton("📖 GESTURE GUIDE")
+        guide_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        guide_btn.setFixedHeight(22)
+        guide_btn.setStyleSheet(f"background: {C.PANEL}; color: {C.PRI}; border: 1px solid {C.PRI_DIM}; border-radius: 2px;")
+        guide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        if self.main_win and hasattr(self.main_win, "_open_gesture_guide"):
+            guide_btn.clicked.connect(self.main_win._open_gesture_guide)
+        ctrl_bar.addWidget(guide_btn)
+
+        ctrl_bar.addStretch()
+        lay.addLayout(ctrl_bar)
+
+        # ── Central Live Camera Feed (320x240 display) ──
+        feed_cont = QHBoxLayout()
+        feed_cont.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._feed_lbl = QLabel()
+        self._feed_lbl.setFixedSize(320, 240)
+        self._feed_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._feed_lbl.setStyleSheet(f"background: #000508; border: 1px solid {C.BORDER_A}; border-radius: 4px;")
+        feed_cont.addWidget(self._feed_lbl)
+        lay.addLayout(feed_cont)
+
+        # ── Telemetry & Gesture Indicator ──
+        tele_grid = QVBoxLayout()
+        tele_grid.setSpacing(3)
+
+        row1 = QHBoxLayout()
+        self._gesture_lbl = QLabel("GESTURE: ✋ None")
+        self._gesture_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._gesture_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        row1.addWidget(self._gesture_lbl)
+
+        row1.addSpacing(12)
+        conf_title = QLabel("CONFIDENCE:")
+        conf_title.setFont(QFont("Courier New", 7))
+        conf_title.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        row1.addWidget(conf_title)
+
+        self._conf_bar = QProgressBar()
+        self._conf_bar.setRange(0, 100)
+        self._conf_bar.setValue(0)
+        self._conf_bar.setFixedSize(100, 12)
+        self._conf_bar.setTextVisible(True)
+        self._conf_bar.setFont(QFont("Courier New", 6))
+        self._conf_bar.setStyleSheet(f"""
+            QProgressBar {{
+                background: #001018; border: 1px solid {C.BORDER}; border-radius: 2px; text-align: center; color: {C.WHITE};
+            }}
+            QProgressBar::chunk {{ background: {C.PRI}; }}
+        """)
+        row1.addWidget(self._conf_bar)
+
+        row1.addStretch()
+        self._state_lbl = QLabel("STATE: IDLE (0/8 frames)")
+        self._state_lbl.setFont(QFont("Courier New", 7))
+        self._state_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        row1.addWidget(self._state_lbl)
+        tele_grid.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        self._last_action_lbl = QLabel("LAST ACTION: Idle")
+        self._last_action_lbl.setFont(QFont("Courier New", 7))
+        self._last_action_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        row2.addWidget(self._last_action_lbl)
+
+        row2.addStretch()
+        self._zoom_lbl = QLabel("ZOOM: 1.0x")
+        self._zoom_lbl.setFont(QFont("Courier New", 7))
+        self._zoom_lbl.setStyleSheet(f"color: {C.ACC}; background: transparent;")
+        row2.addWidget(self._zoom_lbl)
+        tele_grid.addLayout(row2)
+
+        # Performance Stats: FPS, Latency, Hands, Landmarks
+        self._stats_lbl = QLabel("FPS: 30  │  LATENCY: 0ms  │  HANDS: 0  │  LANDMARKS: 0")
+        self._stats_lbl.setFont(QFont("Courier New", 7))
+        self._stats_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._stats_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: #000c14; border: 1px solid {C.BORDER}; border-radius: 2px; padding: 2px;")
+        tele_grid.addWidget(self._stats_lbl)
+
+        lay.addLayout(tele_grid)
+
+        # ── Gesture History Log (Last 5 gestures with timestamps) ──
+        self._history_lbl = QLabel("HISTORY: (no gestures logged yet)")
+        self._history_lbl.setFont(QFont("Courier New", 7))
+        self._history_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; padding-top: 2px;")
+        lay.addWidget(self._history_lbl)
+
+        # Frame poll timer (30ms non-blocking decoupled queue reader)
+        self._frame_tmr = QTimer(self)
+        self._frame_tmr.timeout.connect(self._poll_frame_queue)
+        self._frame_tmr.start(30)
+
+    def set_frame_pixmap(self, px: QPixmap) -> None:
+        if not px.isNull():
+            self._feed_lbl.setPixmap(px.scaled(320, 240, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+
+    def update_stats(self, stats: dict) -> None:
+        fps = stats.get("fps", 30.0)
+        lat = stats.get("latency_ms", 0.0)
+        hands = stats.get("hands", 0)
+        lms = stats.get("landmarks", 0)
+        self._stats_lbl.setText(f"FPS: {fps:.0f}  │  LATENCY: {lat:.0f}ms  │  HANDS: {hands}  │  LANDMARKS: {lms}")
+
+        gesture = stats.get("gesture", "None")
+        conf = stats.get("confidence", 0.0)
+        progress = stats.get("frame_progress", 0)
+        req = stats.get("required_frames", 8)
+        zoom = stats.get("zoom", 1.0)
+
+        try:
+            from actions.gesture_control import GESTURE_ICONS
+            icon = GESTURE_ICONS.get(gesture, "🖐")
+        except Exception:
+            icon = "🖐"
+        self._gesture_lbl.setText(f"GESTURE: {icon} {gesture.replace('_', ' ')}")
+        self._conf_bar.setValue(int(conf * 100))
+
+        if progress > 0 and progress < req:
+            self._state_lbl.setText(f"STATE: DETECTING ({progress}/{req} frames)")
+        elif progress >= req:
+            self._state_lbl.setText("STATE: CONFIRMED")
+        else:
+            self._state_lbl.setText("STATE: IDLE")
+
+        self._zoom_lbl.setText(f"ZOOM: {zoom:.1f}x")
+
+    def _poll_frame_queue(self) -> None:
+        try:
+            from actions.gesture_control import GestureController
+            ctrl = GestureController.get_instance()
+            if ctrl.engine.running:
+                try:
+                    frame = ctrl.engine.frame_queue.get_nowait()
+                    if frame is not None:
+                        h, w, ch = frame.shape
+                        qimg = QImage(frame.data, w, h, ch * w, QImage.Format.Format_BGR888)
+                        self.set_frame_pixmap(QPixmap.fromImage(qimg))
+                except Exception:
+                    pass
+
+                # Update history
+                if ctrl.engine.history:
+                    hist_lines = [f"{item['time']} — {item['gesture']} → {item['action']}" for item in ctrl.engine.history[-2:]]
+                    self._history_lbl.setText(" | ".join(hist_lines))
+                    self._last_action_lbl.setText(f"LAST ACTION: {ctrl.engine.history[-1]['action']}")
+        except Exception:
+            pass
+
+    def _on_toggle_camera(self) -> None:
+        try:
+            from actions.gesture_control import GestureController
+            ctrl = GestureController.get_instance()
+            enabled = ctrl.toggle_camera()
+            self._toggle_btn.setText("📷 ENABLED" if enabled else "📷 DISABLED")
+        except Exception:
+            pass
+
+    def _on_flip_camera(self) -> None:
+        try:
+            from actions.gesture_control import GestureController
+            ctrl = GestureController.get_instance()
+            flipped = ctrl.toggle_flip()
+            self._flip_btn.setText("🪞 FLIPPED" if flipped else "🪞 NORMAL")
+        except Exception:
+            pass
+
+    def _adjust_brightness(self, delta: int) -> None:
+        try:
+            from actions.gesture_control import GestureController
+            ctrl = GestureController.get_instance()
+            ctrl.adjust_brightness(delta)
+        except Exception:
+            pass
+
+
 class ConfirmBanner(_HudOverlay):
     """The gate in front of an action that cannot be taken back.
+
 
     The old confirmation was a tool parameter the model filled in itself, which
     means it confirmed its own shutdown requests. This is the interface asking,
@@ -2401,15 +2853,55 @@ class AudioDeviceOverlay(_HudOverlay):
             self.picked.emit()
 
 
+class MemoryListDelegate(QStyledItemDelegate):
+    """Custom fast delegate rendering memory facts without individual QLabels."""
+
+    def paint(self, painter, option, index):
+        painter.save()
+        rect = option.rect
+        key = str(index.data(Qt.ItemDataRole.UserRole) or "")
+        val = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        meta = str(index.data(Qt.ItemDataRole.UserRole + 1) or "")
+
+        # Background state
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.fillRect(rect, QColor(0, 42, 60, 220))
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(rect, QColor(0, 24, 36, 160))
+
+        # Bottom separator
+        painter.setPen(QPen(QColor(C.BORDER), 1))
+        painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+
+        # Key (Cyan Bold)
+        painter.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        painter.setPen(QColor(C.PRI))
+        key_str = key.replace("_", " ")[:18]
+        painter.drawText(rect.left() + 8, rect.top() + 18, key_str)
+
+        # Value
+        painter.setFont(QFont("Courier New", 8))
+        painter.setPen(QColor(C.TEXT))
+        val_str = f"— {val}"
+        if len(val_str) > 36:
+            val_str = val_str[:33] + "..."
+        painter.drawText(rect.left() + 145, rect.top() + 18, val_str)
+
+        # Meta
+        painter.setFont(QFont("Courier New", 7))
+        painter.setPen(QColor(C.TEXT_DIM))
+        painter.drawText(rect.right() - 110, rect.top() + 18, meta[:15])
+
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), 28)
+
+
 class MemoryOverlay(_HudOverlay):
-    """Everything ARC has stored about you, and when it learned it.
+    """Everything ARC has stored about you, with virtual pagination and QStyledItemDelegate."""
 
-    Memory used to be a 2200-character store that deleted its oldest entries
-    when full and mentioned it only on stdout. The cap is gone; this panel is
-    the other half of that change — a memory you cannot inspect is a memory you
-    cannot trust, and 'delete' has to be something the person can do."""
-
-    _OW = 520
+    _OW = 540
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2423,78 +2915,14 @@ class MemoryOverlay(_HudOverlay):
         """)
         self.setFixedWidth(self._OW)
 
+        self._all_rows: list[dict] = []
+        self._filtered_rows: list[dict] = []
+        self._page = 0
+        self._page_size = 20
+
         self._lay = QVBoxLayout(self)
-        self._lay.setContentsMargins(20, 16, 20, 16)
-        self._lay.setSpacing(5)
-        self._rebuild()
-
-    def _clear_layout(self):
-        """Take every item out of the layout and detach it from the widget tree
-        in this call.
-
-        deleteLater() on its own is not enough: it queues destruction for the
-        next event-loop pass, and until then the old rows are still children of
-        this widget and still paint — which is what drew half of the previous
-        panel over the new one. setParent(None) removes them from the tree now;
-        deleteLater() then frees them safely."""
-        while self._lay.count():
-            item = self._lay.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                # hide() stops it painting in this frame; deleteLater() frees it
-                # safely afterwards. setParent(None) would also stop the paint,
-                # but it turns the widget into a top-level window for the moment
-                # between the two calls, which is not something to leave lying
-                # around inside a click handler.
-                w.hide()
-                w.deleteLater()
-                continue
-            sub = item.layout()
-            if sub is not None:
-                while sub.count():
-                    si = sub.takeAt(0)
-                    sw = si.widget()
-                    if sw is not None:
-                        sw.hide()
-                        sw.deleteLater()
-                sub.deleteLater()
-
-    def _settle(self, before):
-        """Size the panel to its content, re-centre it, and repaint what the old
-        size covered.
-
-        The re-size has to happen here rather than at the end of _rebuild
-        because Qt has not polished the freshly-created children at that point,
-        so the size hint it would read is the empty-layout one. Measured: a
-        first adjustSize() returned 32 px for a panel whose content needed 155,
-        and a second call — after the same widgets had been through the event
-        loop — returned 155. So this runs twice: once now, once on the next
-        turn, from _rebuild.
-
-        The re-centre and the repaint are needed because the overlay is placed
-        by hand and is in no layout: shrinking it leaves it off-centre and
-        leaves its former pixels on screen, since nothing tells the parent that
-        region changed. The repaint has to cover the union of the old and new
-        rectangles."""
-        self._lay.invalidate()
-        self._lay.activate()
-        self.updateGeometry()
-        self.adjustSize()
-
-        p = self.parentWidget()
-        if p is None:
-            self.update()
-            return
-        self.move(max(0, (p.width()  - self.width())  // 2),
-                  max(0, (p.height() - self.height()) // 2))
-        p.update(before.united(self.geometry()))
-        self.update()
-
-    def _rebuild(self):
-        before = self.geometry()
-        self._clear_layout()
-
-        from memory.memory_manager import all_entries_for_ui
+        self._lay.setContentsMargins(18, 14, 18, 14)
+        self._lay.setSpacing(6)
 
         hdr = QLabel("🧠  WHAT ARC REMEMBERS")
         hdr.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
@@ -2505,110 +2933,191 @@ class MemoryOverlay(_HudOverlay):
         sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
         self._lay.addWidget(sep)
 
-        rows = all_entries_for_ui()
+        self._cap = QLabel("Loading memory entries...")
+        self._cap.setWordWrap(True)
+        self._cap.setFont(QFont("Courier New", 7))
+        self._cap.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._lay.addWidget(self._cap)
 
-        cap = QLabel(f"{len(rows)} stored facts — newest first. "
-                     f"Nothing here is sent anywhere; it lives in "
-                     f"memory/long_term.json on this machine.")
-        cap.setWordWrap(True)
-        cap.setFont(QFont("Courier New", 7))
-        cap.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
-        self._lay.addWidget(cap)
+        # Search Bar
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Filter memories by key or content...")
+        self._search.setFont(QFont("Courier New", 8))
+        self._search.setFixedHeight(26)
+        self._search.setStyleSheet(f"""
+            QLineEdit {{
+                background: #000d14; color: {C.WHITE};
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 6px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
+        """)
+        self._search.textChanged.connect(self._on_search_changed)
+        self._lay.addWidget(self._search)
 
-        if not rows:
-            empty = QLabel("Nothing stored yet.")
-            empty.setFont(QFont("Courier New", 9))
-            empty.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
-            self._lay.addWidget(empty)
-        else:
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setFixedHeight(min(420, 34 * len(rows) + 10))
-            scroll.setStyleSheet(
-                f"QScrollArea {{ border: 1px solid {C.BORDER}; border-radius: 3px; "
-                f"background: transparent; }}"
-            )
-            inner = QWidget()
-            ilay  = QVBoxLayout(inner)
-            ilay.setContentsMargins(6, 6, 6, 6)
-            ilay.setSpacing(3)
+        # Virtual List View with Fast Custom Delegate
+        self._list = QListWidget()
+        self._list.setFixedHeight(280)
+        self._list.setStyleSheet(f"""
+            QListWidget {{
+                background: transparent;
+                border: 1px solid {C.BORDER};
+                border-radius: 3px;
+                outline: none;
+            }}
+        """)
+        self._delegate = MemoryListDelegate(self._list)
+        self._list.setItemDelegate(self._delegate)
+        self._lay.addWidget(self._list)
 
-            for r in rows:
-                line = QHBoxLayout(); line.setSpacing(6)
-                txt = QLabel(f"<b>{r['key'].replace('_', ' ')}</b> "
-                             f"<span style='color:{C.TEXT_MED}'>— {r['value']}</span>")
-                txt.setWordWrap(True)
-                txt.setFont(QFont("Courier New", 8))
-                txt.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
-                line.addWidget(txt, 1)
+        # Pagination Controls
+        pag_row = QHBoxLayout(); pag_row.setSpacing(8)
+        self._prev_btn = QPushButton("◀ PREV")
+        self._prev_btn.setFixedSize(65, 24)
+        self._prev_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._prev_btn.setStyleSheet(f"background: {C.PANEL}; color: {C.PRI}; border: 1px solid {C.BORDER}; border-radius: 2px;")
+        self._prev_btn.clicked.connect(self._prev_page)
+        pag_row.addWidget(self._prev_btn)
 
-                meta = QLabel(f"{r['category'][:4]} · {r['updated'] or '—'}")
-                meta.setFont(QFont("Courier New", 7))
-                meta.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
-                line.addWidget(meta)
+        self._page_lbl = QLabel("Page 1 / 1")
+        self._page_lbl.setFont(QFont("Courier New", 8))
+        self._page_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._page_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        pag_row.addWidget(self._page_lbl, 1)
 
-                rm = QPushButton("✕")
-                rm.setFixedSize(20, 20)
-                rm.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-                rm.setCursor(Qt.CursorShape.PointingHandCursor)
-                rm.setToolTip("Forget this")
-                rm.setStyleSheet(f"""
-                    QPushButton {{ background: transparent; color: {C.TEXT_DIM};
-                        border: 1px solid {C.BORDER}; border-radius: 3px; }}
-                    QPushButton:hover {{ color: {C.RED}; border-color: {C.RED}; }}
-                """)
-                rm.clicked.connect(
-                    lambda _=False, c=r["category"], k=r["key"]: self._forget(c, k))
-                line.addWidget(rm)
+        self._next_btn = QPushButton("NEXT ▶")
+        self._next_btn.setFixedSize(65, 24)
+        self._next_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._next_btn.setStyleSheet(f"background: {C.PANEL}; color: {C.PRI}; border: 1px solid {C.BORDER}; border-radius: 2px;")
+        self._next_btn.clicked.connect(self._next_page)
+        pag_row.addWidget(self._next_btn)
 
-                holder = QWidget()
-                holder.setLayout(line)
-                ilay.addWidget(holder)
+        self._lay.addLayout(pag_row)
 
-            ilay.addStretch()
-            scroll.setWidget(inner)
-            self._lay.addWidget(scroll)
-
+        # Action Buttons
         b_row = QHBoxLayout(); b_row.setSpacing(8)
-        exp = QPushButton("💾  EXPORT BACKUP")
-        exp.setFixedHeight(30)
+
+        rm_btn = QPushButton("🗑 FORGET SELECTED")
+        rm_btn.setFixedHeight(28)
+        rm_btn.setFont(QFont("Courier New", 8))
+        rm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        rm_btn.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.RED};
+                border: 1px solid {C.RED}; border-radius: 3px; padding: 0 8px; }}
+            QPushButton:hover {{ background: #330005; }}
+        """)
+        rm_btn.clicked.connect(self._forget_selected)
+        b_row.addWidget(rm_btn)
+
+        exp = QPushButton("💾 EXPORT BACKUP")
+        exp.setFixedHeight(28)
         exp.setFont(QFont("Courier New", 8))
         exp.setCursor(Qt.CursorShape.PointingHandCursor)
         exp.setStyleSheet(f"""
             QPushButton {{ background: transparent; color: {C.PRI};
-                border: 1px solid {C.PRI_DIM}; border-radius: 3px; }}
+                border: 1px solid {C.PRI_DIM}; border-radius: 3px; padding: 0 8px; }}
             QPushButton:hover {{ background: {C.PRI_GHO}; border-color: {C.PRI}; }}
         """)
         exp.clicked.connect(self._export_memory)
         b_row.addWidget(exp)
 
         close = QPushButton("CLOSE")
-        close.setFixedHeight(30)
+        close.setFixedHeight(28)
         close.setFont(QFont("Courier New", 9))
         close.setCursor(Qt.CursorShape.PointingHandCursor)
         close.setStyleSheet(f"""
             QPushButton {{ background: transparent; color: {C.TEXT_MED};
-                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 0 12px; }}
             QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
         """)
         close.clicked.connect(self.hide)
         b_row.addWidget(close)
+
         self._lay.addLayout(b_row)
+        self._load_async()
 
+    def _settle(self, before):
+        p = self.parentWidget()
+        if p is None:
+            self.update()
+            return
+        self.move(max(0, (p.width() - self.width()) // 2),
+                  max(0, (p.height() - self.height()) // 2))
+        p.update(before.united(self.geometry()))
+        self.update()
+
+    def _load_async(self):
+        before = self.geometry()
+        from memory.memory_manager import all_entries_for_ui
+        worker = HeavyWorker(all_entries_for_ui)
+        worker.signals.result.connect(self._on_data_loaded)
+        QThreadPool.globalInstance().start(worker)
         self._settle(before)
-        # …and again once Qt has polished the new children, because the size
-        # hint is not final until then. Harmless when the first pass already
-        # got it right: _settle is idempotent.
-        QTimer.singleShot(0, lambda g=before: self._settle(g))
 
-    def _forget(self, category: str, key: str):
-        from memory.memory_manager import forget
-        forget(key, category)
-        # Rebuild on the NEXT event-loop turn, not inside this click handler.
-        # The rebuild destroys the very ✕ button that emitted this signal, and
-        # Qt is entitled to touch the sender after a slot returns; tearing it
-        # down mid-emission is how a widget ends up half-alive on screen.
-        QTimer.singleShot(0, self._rebuild)
+    def _on_data_loaded(self, rows):
+        self._all_rows = rows or []
+        self._filtered_rows = list(self._all_rows)
+        self._page = 0
+        self._cap.setText(f"{len(self._all_rows)} stored facts — newest first. Lives locally in memory/long_term.json.")
+        self._render_page()
+
+    def _on_search_changed(self, text: str):
+        query = text.strip().lower()
+        if not query:
+            self._filtered_rows = list(self._all_rows)
+        else:
+            self._filtered_rows = [
+                r for r in self._all_rows
+                if query in str(r.get("key", "")).lower() or query in str(r.get("value", "")).lower()
+            ]
+        self._page = 0
+        self._render_page()
+
+    def _render_page(self):
+        self._list.clear()
+        total = len(self._filtered_rows)
+        total_pages = max(1, math.ceil(total / self._page_size))
+        self._page = max(0, min(self._page, total_pages - 1))
+
+        start_idx = self._page * self._page_size
+        end_idx = min(start_idx + self._page_size, total)
+        slice_rows = self._filtered_rows[start_idx:end_idx]
+
+        for r in slice_rows:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, r.get("key", ""))
+            item.setData(Qt.ItemDataRole.DisplayRole, r.get("value", ""))
+            meta_str = f"{str(r.get('category', ''))[:4]} · {r.get('updated', '') or '—'}"
+            item.setData(Qt.ItemDataRole.UserRole + 1, meta_str)
+            item.setData(Qt.ItemDataRole.UserRole + 2, r.get("category", ""))
+            self._list.addItem(item)
+
+        self._page_lbl.setText(f"Page {self._page + 1} / {total_pages} ({total} items)")
+        self._prev_btn.setEnabled(self._page > 0)
+        self._next_btn.setEnabled(self._page < total_pages - 1)
+
+    def _prev_page(self):
+        if self._page > 0:
+            self._page -= 1
+            self._render_page()
+
+    def _next_page(self):
+        total_pages = max(1, math.ceil(len(self._filtered_rows) / self._page_size))
+        if self._page < total_pages - 1:
+            self._page += 1
+            self._render_page()
+
+    def _forget_selected(self):
+        item = self._list.currentItem()
+        if not item:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        cat = item.data(Qt.ItemDataRole.UserRole + 2)
+        if key:
+            from memory.memory_manager import forget
+            forget(key, cat)
+            self._load_async()
 
     def _export_memory(self):
         import shutil
@@ -2621,7 +3130,7 @@ class MemoryOverlay(_HudOverlay):
             docs = Path.home() / "Documents"
             docs.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            dest = docs / f"jarvis_memory_backup_{ts}.json"
+            dest = docs / f"arc_memory_backup_{ts}.json"
             shutil.copy2(mem_path, dest)
             p = self.parent()
             while p and not hasattr(p, "append_log"):
@@ -2630,6 +3139,7 @@ class MemoryOverlay(_HudOverlay):
                 p.append_log(f"SYS: Memory backup saved to Documents/{dest.name}")
         except Exception as e:
             print(f"[Memory] Export failed: {e}")
+
 
 
 class IncidentTimelineOverlay(_HudOverlay):
@@ -3480,129 +3990,19 @@ class MainWindow(QMainWindow):
         self.hud.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._content_panel = self._build_content_panel()
 
-        # Live camera container — replaces HUD when camera stream is active
-        _cam_cont = QWidget()
-        _cam_cont.setStyleSheet(f"background: #000408; border: 1px solid {C.BORDER};")
-        _cam_v = QVBoxLayout(_cam_cont)
-        _cam_v.setContentsMargins(6, 6, 6, 6)
-        _cam_v.setSpacing(4)
+        # Reinforced Camera Console Panel — stacked with HUD
+        self._cam_console_panel = CameraConsolePanel(main_win=self)
+        self._cam_live_lbl = self._cam_console_panel._feed_lbl
+        self._cam_combo = self._cam_console_panel._cam_combo
+        self._cam_info_lbl = self._cam_console_panel._stats_lbl
+        self._gesture_detected_lbl = self._cam_console_panel._gesture_lbl
+        self._cam_gesture_btn = self._cam_console_panel._gesture_btn
 
-        # ── Top Console Toolbar ──────────────────────────────────────────────
-        _cam_hdr = QHBoxLayout()
-        _cam_hdr.setContentsMargins(4, 2, 4, 2)
-        _cam_hdr.setSpacing(8)
-
-        _cam_title = QLabel("◈ OPTICAL SENSOR & GESTURE CONSOLE")
-        _cam_title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        _cam_title.setStyleSheet(f"color: {C.PRI}; background: transparent; border: none;")
-        _cam_hdr.addWidget(_cam_title)
-
-        _cam_hdr.addSpacing(6)
-
-        # Camera Selector Dropdown
-        self._cam_combo = QComboBox()
-        self._cam_combo.setFont(QFont("Courier New", 8))
-        self._cam_combo.setStyleSheet(f"""
-            QComboBox {{
-                background: {C.PANEL2}; color: {C.TEXT};
-                border: 1px solid {C.BORDER_A}; border-radius: 3px;
-                padding: 2px 6px; min-width: 150px;
-            }}
-            QComboBox QAbstractItemView {{
-                background: {C.DARK}; color: {C.TEXT};
-                selection-background-color: {C.PRI_GHO}; selection-color: {C.PRI};
-            }}
-        """)
-        self._cam_combo.currentIndexChanged.connect(self._on_camera_selected)
-        _cam_hdr.addWidget(self._cam_combo)
-
-        # Gesture Control Toggle Button
-        self._cam_gesture_btn = QPushButton("🖐 GESTURES: OFF")
-        self._cam_gesture_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._cam_gesture_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._cam_gesture_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {C.PANEL2}; color: {C.TEXT_DIM};
-                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 3px 8px;
-            }}
-            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI}; }}
-        """)
-        self._cam_gesture_btn.clicked.connect(self._toggle_gesture_control)
-        _cam_hdr.addWidget(self._cam_gesture_btn)
-
-        # AI Vision Scan Trigger
-        self._cam_scan_btn = QPushButton("🔍 AI SCAN")
-        self._cam_scan_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._cam_scan_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._cam_scan_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {C.PANEL2}; color: {C.ACC};
-                border: 1px solid {C.ACC}; border-radius: 3px; padding: 3px 8px;
-            }}
-            QPushButton:hover {{ background: {C.PRI_GHO}; color: {C.PRI}; }}
-        """)
-        self._cam_scan_btn.clicked.connect(self._on_ai_vision_scan)
-        _cam_hdr.addWidget(self._cam_scan_btn)
-
-        _cam_hdr.addStretch()
-
-        _cam_x = QPushButton("✕ CLOSE")
-        _cam_x.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        _cam_x.setCursor(Qt.CursorShape.PointingHandCursor)
-        _cam_x.setStyleSheet(f"""
-            QPushButton {{
-                color: {C.TEXT_DIM}; background: transparent;
-                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 8px;
-            }}
-            QPushButton:hover {{ color: {C.RED}; border-color: {C.RED}; }}
-        """)
-        _cam_x.clicked.connect(self.stop_camera_stream)
-        _cam_hdr.addWidget(_cam_x)
-        _cam_v.addLayout(_cam_hdr)
-
-        # ── Main Video Display Viewport ──────────────────────────────────────
-        self._cam_live_lbl = QLabel()
-        self._cam_live_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._cam_live_lbl.setStyleSheet(f"background: #000408; border: 1px solid {C.BORDER_A}; border-radius: 4px;")
-        self._cam_live_lbl.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        _cam_v.addWidget(self._cam_live_lbl, stretch=1)
-
-        # ── Bottom Telemetry & Gesture Detection Feedback Strip ─────────────
-        _cam_footer = QHBoxLayout()
-        _cam_footer.setContentsMargins(4, 2, 4, 2)
-        _cam_footer.setSpacing(8)
-
-        self._cam_info_lbl = QLabel("CAMERA: Probing active sensor...")
-        self._cam_info_lbl.setFont(QFont("Courier New", 7))
-        self._cam_info_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent; border: none;")
-        _cam_footer.addWidget(self._cam_info_lbl)
-
-        _cam_footer.addStretch()
-
-        self._gesture_detected_lbl = QLabel("DETECTED GESTURE: None")
-        self._gesture_detected_lbl.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._gesture_detected_lbl.setStyleSheet(
-            f"color: {C.TEXT_DIM}; background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 8px;"
-        )
-        _cam_footer.addWidget(self._gesture_detected_lbl)
-        _cam_v.addLayout(_cam_footer)
-
-        # ── Gesture Quick Guide Ribbon ───────────────────────────────────────
-        _legend_lbl = QLabel(
-            "✌ Peace: Remote QR  |  👍 Thumbs: Confirm  |  ✊ Fist: Interrupt  |  "
-            "🖐 Palm: Mute  |  🤏 Pinch: Zoom  |  ↕ 2-Fingers: Scroll  |  👈/👉 Swipe: Virtual Desktop"
-        )
-        _legend_lbl.setFont(QFont("Courier New", 7))
-        _legend_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _legend_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: {C.DARK}; border: none; border-radius: 2px; padding: 2px;")
-        _cam_v.addWidget(_legend_lbl)
-
-        # Stack: 0 = animated HUD, 1 = live camera
+        # Stack: 0 = animated HUD, 1 = live camera console
         self._hud_cam_stack = QStackedWidget()
         self._hud_cam_stack.addWidget(self.hud)
-        self._hud_cam_stack.addWidget(_cam_cont)
+        self._hud_cam_stack.addWidget(self._cam_console_panel)
+
 
         self._center_split = QSplitter(Qt.Orientation.Vertical)
         self._center_split.setStyleSheet(f"""
@@ -3756,14 +4156,16 @@ class MainWindow(QMainWindow):
         try:
             from actions.gesture_control import GestureController
             ctrl = GestureController.get_instance(self)
+            if hasattr(self, "_cam_console_panel"):
+                ctrl.engine.on_stats_callback = self._cam_console_panel.update_stats
+            ctrl.on_frame_callback = lambda data: self._cam_frame_sig.emit(data)
+            ctrl.on_gesture_callback = lambda g: self._gesture_sig.emit(True, g)
             if ctrl.is_running():
                 ctrl.stop()
                 self._on_gesture_state_change(False, "None")
             else:
-                ctrl.on_frame_callback = lambda data: self._cam_frame_sig.emit(data)
-                ctrl.on_gesture_callback = lambda g: self._gesture_sig.emit(True, g)
                 ok, msg = ctrl.start()
-                self._on_gesture_state_change(ok, "Tracking Active")
+                self._on_gesture_state_change(ok, "Gesture Tracking Active")
         except Exception as e:
             print(f"[Gesture] Toggle error: {e}")
 
@@ -3825,7 +4227,7 @@ class MainWindow(QMainWindow):
 
         # 4. Update Detected Gesture Label
         if hasattr(self, "_gesture_detected_lbl"):
-            if gesture and gesture not in ("None", "None / Idle"):
+            if gesture and gesture not in ("None", "None / Idle", "Gesture Tracking Active", "Tracking Active"):
                 self._gesture_detected_lbl.setText(f"DETECTED: {gesture}")
                 self._gesture_detected_lbl.setStyleSheet(
                     f"color: {C.GREEN}; background: #002211; border: 1px solid {C.GREEN}; border-radius: 3px; padding: 2px 8px; font-weight: bold;"
@@ -3835,6 +4237,12 @@ class MainWindow(QMainWindow):
                 self._gesture_detected_lbl.setStyleSheet(
                     f"color: {C.TEXT_DIM}; background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 3px; padding: 2px 8px;"
                 )
+
+        # 5. Trigger HUD feedback if gesture confirmed
+        if active and gesture and gesture not in ("None", "None / Idle", "Gesture Tracking Active", "Tracking Active"):
+            if hasattr(self, "hud") and hasattr(self.hud, "trigger_gesture_feedback"):
+                self.hud.trigger_gesture_feedback(gesture)
+
 
     def _on_cam_stream(self, start: bool) -> None:
         if start:
@@ -4372,7 +4780,7 @@ class MainWindow(QMainWindow):
             self._bar_tmp.set_value(0, "N/A")
 
         try:
-            boot_t  = psutil.boot_time()
+            boot_t  = snap.get("boot_time", time.time())
             elapsed = time.time() - boot_t
             h = int(elapsed // 3600)
             m = int((elapsed % 3600) // 60)
@@ -4381,10 +4789,11 @@ class MainWindow(QMainWindow):
             self._uptime_lbl.setText("UP  --:--")
 
         try:
-            proc_count = len(psutil.pids())
+            proc_count = snap.get("proc_count", 0)
             self._proc_lbl.setText(f"PROC  {proc_count}")
         except Exception:
             self._proc_lbl.setText("PROC  --")
+
 
 
     def _build_header(self) -> QWidget:
@@ -4876,17 +5285,59 @@ class MainWindow(QMainWindow):
         incidents_btn.clicked.connect(self._open_incident_timeline)
         lay.addWidget(incidents_btn)
 
+        cam_btn = QPushButton("📷  CAMERA CONSOLE")
+        cam_btn.setFixedHeight(26)
+        cam_btn.setFont(QFont("Courier New", 7))
+        cam_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cam_btn.setStyleSheet(_BTN_STYLE_DIM)
+        cam_btn.clicked.connect(self._toggle_camera_console)
+        lay.addWidget(cam_btn)
+
+        guide_btn = QPushButton("🖐  GESTURE GUIDE")
+        guide_btn.setFixedHeight(26)
+        guide_btn.setFont(QFont("Courier New", 7))
+        guide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        guide_btn.setStyleSheet(_BTN_STYLE_DIM)
+        guide_btn.clicked.connect(self._open_gesture_guide)
+        lay.addWidget(guide_btn)
+
         w.adjustSize()
         return w
 
     def _toggle_drawer(self, checked: bool):
+        if not hasattr(self, '_quick_drawer'):
+            return
+        if not hasattr(self, '_drawer_anim'):
+            self._drawer_anim = QPropertyAnimation(self._quick_drawer, b"maximumHeight")
+            self._drawer_anim.setDuration(200)
+            self._drawer_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
         if checked:
-            self._refresh_wake_btns()   # resolve wake state on open (lazy)
             self._position_quick_drawer()
             self._quick_drawer.show()
             self._quick_drawer.raise_()
+            target_h = max(440, self._quick_drawer.sizeHint().height())
+            self._drawer_anim.stop()
+            self._drawer_anim.setStartValue(0)
+            self._drawer_anim.setEndValue(target_h)
+            self._drawer_anim.start()
+
+            # Lazy load data with 30s cache offloaded to HeavyWorker
+            now = time.time()
+            if not hasattr(self, '_drawer_cached_time') or (now - self._drawer_cached_time > 30.0):
+                self._drawer_cached_time = now
+                worker = HeavyWorker(self._refresh_wake_btns)
+                QThreadPool.globalInstance().start(worker)
         else:
-            self._quick_drawer.hide()
+            self._drawer_anim.stop()
+            self._drawer_anim.setStartValue(self._quick_drawer.height())
+            self._drawer_anim.setEndValue(0)
+            try:
+                self._drawer_anim.finished.disconnect()
+            except Exception:
+                pass
+            self._drawer_anim.finished.connect(self._quick_drawer.hide)
+            self._drawer_anim.start()
 
     def _position_quick_drawer(self):
         if not hasattr(self, '_quick_drawer'):
@@ -4895,6 +5346,7 @@ class MainWindow(QMainWindow):
         self._quick_drawer.setFixedWidth(_W)
         self._quick_drawer.adjustSize()
         self._quick_drawer.setGeometry(12, 54, _W, self._quick_drawer.sizeHint().height())
+
 
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(5)
@@ -5449,6 +5901,14 @@ class MainWindow(QMainWindow):
         self._incident_overlay = ov
         ov.show()
         ov.raise_()
+
+    def _open_gesture_guide(self):
+        ov = GestureGuideOverlay(parent=self.centralWidget())
+        self._centre_overlay(ov)
+        self._gesture_guide_overlay = ov
+        ov.show()
+        ov.raise_()
+
 
     def _update_cyber_shield_btn(self, severity: str, count: int = 0):
         if not hasattr(self, "_btn_cyber_shield"):

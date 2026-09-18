@@ -1,20 +1,10 @@
 """
 actions/gesture_control.py — ARC Camera Hand Gesture Recognition & Control.
 
-Runs a background thread monitoring webcam feed with MediaPipe (21 landmarks)
-to recognize system control gestures:
-1. Zoom in/out (pinch thumb 4 + index 8 distance)
-2. Scroll up/down (two fingers 8 & 12 extended, vertical motion)
-3. Mute/unmute (open palm held 1.5s)
-4. Trigger QR code (V / peace sign held 1.0s -> player.open_remote())
-5. Swipe left/right (rapid horizontal motion -> switch virtual desktop / tabs)
-6. Thumbs up (confirm destructive action / confirm gate -> core.confirm.resolve(True))
-7. Fist (cancel action / interrupt -> core.confirm.resolve(False) + player.interrupt())
-
-Adaptive framerate:
-- 30 FPS active tracking
-- 10 FPS standby after 5s of no hands detected
-- Toggles HUD "GESTURE ACTIVE" pill via player.set_gesture_active(True/False)
+Reinforced 30 FPS background engine with MediaPipe hand tracking, 20-gesture vocabulary
+(15 single-hand + 5 two-hand), smart state-machine debouncing (8 frames), hold detection
+(1.0s hold for fist/palms), smooth zoom interpolation (0.5x–3.0x), and decoupled
+thread-safe frame and gesture queues.
 """
 
 from __future__ import annotations
@@ -23,7 +13,7 @@ import math
 import sys
 import threading
 import time
-from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, Callable, Optional, Tuple
 
 try:
@@ -40,26 +30,775 @@ except ImportError:
     _PYAUTOGUI = False
 
 
+# ── Landmark & Finger Helpers ──────────────────────────────────────────────────
+
+class Landmark:
+    """Represents a 3D normalized hand landmark."""
+    __slots__ = ("x", "y", "z")
+
+    def __init__(self, x: float = 0.0, y: float = 0.0, z: float = 0.0):
+        self.x = float(x)
+        self.y = float(y)
+        self.z = float(z)
+
+    def __getitem__(self, item: int) -> float:
+        if item == 0:
+            return self.x
+        elif item == 1:
+            return self.y
+        elif item == 2:
+            return self.z
+        raise IndexError(f"Landmark index out of range: {item}")
+
+    def __repr__(self) -> str:
+        return f"Landmark(x={self.x:.3f}, y={self.y:.3f}, z={self.z:.3f})"
+
+
+def _get_xyz(lm: Any) -> Tuple[float, float, float]:
+    if hasattr(lm, "x") and hasattr(lm, "y"):
+        return float(lm.x), float(lm.y), float(getattr(lm, "z", 0.0))
+    if isinstance(lm, dict):
+        return float(lm.get("x", 0.0)), float(lm.get("y", 0.0)), float(lm.get("z", 0.0))
+    if isinstance(lm, (list, tuple)):
+        return float(lm[0]), float(lm[1]), float(lm[2]) if len(lm) > 2 else 0.0
+    return 0.0, 0.0, 0.0
+
+
+def finger_is_up(landmarks: list[Any], finger_tip: int, finger_pip: int) -> bool:
+    """In image coordinates (y=0 top, y=1 bottom), tip is higher when y is smaller."""
+    _, y_tip, _ = _get_xyz(landmarks[finger_tip])
+    _, y_pip, _ = _get_xyz(landmarks[finger_pip])
+    return y_tip < y_pip
+
+
+# ── 20 Gesture Vocabulary Matrix ─────────────────────────────────────────────
+
+GESTURES = {
+    # One hand gestures (G01 - G15)
+    "INDEX_UP": "scroll activity log up",
+    "INDEX_DOWN": "scroll activity log down",
+    "PEACE": "screenshot + analyze screen",
+    "THREE_FINGERS": "show QR code dashboard",
+    "FOUR_FINGERS": "open settings drawer",
+    "OPEN_PALM": "pause/resume ARC listening",
+    "FIST": "mute/unmute microphone",
+    "THUMBS_UP": "confirm pending action",
+    "THUMBS_DOWN": "cancel pending action",
+    "PINCH": "zoom in on sphere",
+    "SPREAD": "zoom out on sphere",
+    "POINT_LEFT": "previous panel",
+    "POINT_RIGHT": "next panel",
+    "OK_SIGN": "acknowledge/OK current notification",
+    "CALL_ME": "toggle voice listening mode",
+    # Two hand gestures (G16 - G20)
+    "BOTH_PINCH_APART": "zoom in HUD",
+    "BOTH_PINCH_TOGETHER": "zoom out HUD",
+    "BOTH_OPEN_PALMS": "emergency stop all active tools",
+    "LEFT_FIST_RIGHT_PEACE": "generate security report",
+    "BOTH_THUMBS_UP": "extra confirmation for critical actions",
+}
+
+GESTURE_ICONS = {
+    "INDEX_UP": "☝️",
+    "INDEX_DOWN": "👇",
+    "PEACE": "✌️",
+    "THREE_FINGERS": "🤟",
+    "FOUR_FINGERS": "🖖",
+    "OPEN_PALM": "✋",
+    "FIST": "✊",
+    "THUMBS_UP": "👍",
+    "THUMBS_DOWN": "👎",
+    "PINCH": "🤏",
+    "SPREAD": "👐",
+    "POINT_LEFT": "👈",
+    "POINT_RIGHT": "👉",
+    "OK_SIGN": "👌",
+    "CALL_ME": "🤙",
+    "BOTH_PINCH_APART": "🔍+",
+    "BOTH_PINCH_TOGETHER": "🔍-",
+    "BOTH_OPEN_PALMS": "🛑",
+    "LEFT_FIST_RIGHT_PEACE": "🛡️",
+    "BOTH_THUMBS_UP": "🙌",
+}
+
+
+# ── Gesture Classifier ───────────────────────────────────────────────────────
+
+def classify_gesture(landmarks: list[Any], hand_label: str = "Right") -> Tuple[Optional[str], float]:
+    """
+    Classifies a 21-landmark hand configuration into one of the recognized gestures.
+    Returns (gesture_name, confidence). Returns (None, 0.0) if no match.
+    """
+    if len(landmarks) < 21:
+        return None, 0.0
+
+    wx, wy, _ = _get_xyz(landmarks[0])
+    tx, ty, _ = _get_xyz(landmarks[4])
+    t_ip_x, t_ip_y, _ = _get_xyz(landmarks[3])
+    t_mcp_x, t_mcp_y, _ = _get_xyz(landmarks[2])
+    ix, iy, _ = _get_xyz(landmarks[8])
+    i_pip_x, i_pip_y, _ = _get_xyz(landmarks[6])
+    i_mcp_x, i_mcp_y, _ = _get_xyz(landmarks[5])
+    mx, my, _ = _get_xyz(landmarks[12])
+    m_pip_x, m_pip_y, _ = _get_xyz(landmarks[10])
+    rx, ry, _ = _get_xyz(landmarks[16])
+    r_pip_x, r_pip_y, _ = _get_xyz(landmarks[14])
+    px, py, _ = _get_xyz(landmarks[20])
+    p_pip_x, p_pip_y, _ = _get_xyz(landmarks[18])
+
+    index_up = iy < i_pip_y
+    middle_up = my < m_pip_y
+    ring_up = ry < r_pip_y
+    pinky_up = py < p_pip_y
+
+    # Distance functions
+    def dist_pts(x1, y1, x2, y2):
+        return math.hypot(x1 - x2, y1 - y2)
+
+    pinch_dist = dist_pts(tx, ty, ix, iy)
+    thumb_dist_wrist = dist_pts(tx, ty, wx, wy)
+    index_ext_dist = dist_pts(ix, iy, i_mcp_x, i_mcp_y)
+
+    thumb_up = ty < t_ip_y - 0.04 and ty < t_mcp_y - 0.06 and ty < i_mcp_y
+    thumb_down = ty > t_ip_y + 0.04 and ty > t_mcp_y + 0.06 and ty > wy + 0.02
+
+    pointing_left = (ix < i_pip_x - 0.08) and (ix < i_mcp_x - 0.08) and abs(iy - i_pip_y) < 0.12
+    pointing_right = (ix > i_pip_x + 0.08) and (ix > i_mcp_x + 0.08) and abs(iy - i_pip_y) < 0.12
+    index_down = (iy > i_pip_y + 0.05) and (iy > i_mcp_y + 0.05) and (index_ext_dist > 0.18)
+
+    # 1. G14 - OK SIGN (Thumb + Index touch forming circle, middle, ring, pinky up)
+    if pinch_dist < 0.08 and middle_up and ring_up and pinky_up:
+        return "OK_SIGN", 0.93
+
+    # 2. G06 - OPEN PALM / G05 - FOUR FINGERS
+    if index_up and middle_up and ring_up and pinky_up:
+        if thumb_up or thumb_dist_wrist > 0.22:
+            return "OPEN_PALM", 0.95
+        else:
+            return "FOUR_FINGERS", 0.92
+
+    # 3. G04 - THREE FINGERS (Index, Middle, Ring up, Pinky curled)
+    if index_up and middle_up and ring_up and (not pinky_up) and (not thumb_up):
+        return "THREE_FINGERS", 0.93
+
+    # 4. G03 - PEACE / V SIGN (Index & Middle up, Ring & Pinky curled)
+    if index_up and middle_up and (not ring_up) and (not pinky_up) and not thumb_up and pinch_dist > 0.07:
+        return "PEACE", 0.94
+
+    # 5. G15 - CALL ME (Thumb & Pinky extended, middle three curled)
+    if (thumb_up or thumb_dist_wrist > 0.20) and pinky_up and (not index_up) and (not middle_up) and (not ring_up):
+        return "CALL_ME", 0.93
+
+    # 6. G12 - POINT LEFT / G13 - POINT RIGHT
+    if pointing_left and (not middle_up) and (not ring_up) and (not pinky_up):
+        return "POINT_LEFT", 0.92
+
+    if pointing_right and (not middle_up) and (not ring_up) and (not pinky_up):
+        return "POINT_RIGHT", 0.92
+
+    # 7. G08 - THUMBS UP / G09 - THUMBS DOWN
+    if thumb_up and (not index_up) and (not middle_up) and (not ring_up) and (not pinky_up):
+        return "THUMBS_UP", 0.96
+
+    if thumb_down and (not index_up) and (not middle_up) and (not ring_up) and (not pinky_up):
+        return "THUMBS_DOWN", 0.96
+
+    # 8. G02 - INDEX DOWN / G01 - INDEX UP
+    if index_down and (not middle_up) and (not ring_up) and (not pinky_up) and (not thumb_up) and (not thumb_down):
+        return "INDEX_DOWN", 0.93
+
+    if index_up and (not middle_up) and (not ring_up) and (not pinky_up) and (not thumb_up) and (not pointing_left) and (not pointing_right):
+        return "INDEX_UP", 0.95
+
+    # 9. G10 - PINCH / G11 - SPREAD
+    if pinch_dist < 0.07 and (not middle_up) and (not ring_up) and (not pinky_up) and (index_ext_dist > 0.14):
+        return "PINCH", 0.90
+
+    if pinch_dist > 0.28 and (not middle_up) and (not ring_up) and (not pinky_up):
+        return "SPREAD", 0.89
+
+    # 10. G07 - FIST (all fingers curled)
+    all_curled = (not index_up) and (not middle_up) and (not ring_up) and (not pinky_up)
+    if all_curled and (not thumb_up) and (not thumb_down):
+        return "FIST", 0.94
+
+    return None, 0.0
+
+
+
+def classify_two_hand_gesture(
+    landmarks_left: list[Any],
+    landmarks_right: list[Any],
+    prev_hand_dist: Optional[float] = None,
+) -> Tuple[Optional[str], float, float]:
+    """
+    Classifies dual-hand interactions G16 to G20.
+    Returns (gesture_name, confidence, current_hand_dist).
+    """
+    g_left, conf_l = classify_gesture(landmarks_left, "Left")
+    g_right, conf_r = classify_gesture(landmarks_right, "Right")
+
+    # Measure distance between wrists or palms
+    w_lx, w_ly, _ = _get_xyz(landmarks_left[0])
+    w_rx, w_ry, _ = _get_xyz(landmarks_right[0])
+    cur_dist = math.hypot(w_lx - w_rx, w_ly - w_ry)
+
+    # G20 - BOTH THUMBS UP
+    if g_left == "THUMBS_UP" and g_right == "THUMBS_UP":
+        return "BOTH_THUMBS_UP", 0.98, cur_dist
+
+    # G18 - BOTH OPEN PALMS
+    if g_left == "OPEN_PALM" and g_right == "OPEN_PALM":
+        return "BOTH_OPEN_PALMS", 0.98, cur_dist
+
+    # G19 - LEFT FIST + RIGHT PEACE
+    if g_left == "FIST" and g_right == "PEACE":
+        return "LEFT_FIST_RIGHT_PEACE", 0.95, cur_dist
+
+    # G16 & G17 - Dual Pinch Apart / Together
+    if (g_left in ("PINCH", "SPREAD")) and (g_right in ("PINCH", "SPREAD")):
+        if prev_hand_dist is not None:
+            delta = cur_dist - prev_hand_dist
+            if delta > 0.03:
+                return "BOTH_PINCH_APART", 0.92, cur_dist
+            elif delta < -0.03:
+                return "BOTH_PINCH_TOGETHER", 0.92, cur_dist
+
+    return None, 0.0, cur_dist
+
+
+# ── Hold Detector ────────────────────────────────────────────────────────────
+
+class GestureHoldDetector:
+    """Tracks continuous gesture hold time with normalized progress 0.0 to 1.0."""
+
+    def __init__(self, gesture_name: str, hold_duration_s: float = 1.0):
+        self.gesture_name = gesture_name
+        self.hold_duration = float(hold_duration_s)
+        self.hold_start: Optional[float] = None
+        self.progress: float = 0.0
+
+    def update(self, gesture_detected: bool) -> bool:
+        now = time.time()
+        if gesture_detected:
+            if self.hold_start is None:
+                self.hold_start = now
+            elapsed = now - self.hold_start
+            self.progress = min(elapsed / max(0.001, self.hold_duration), 1.0)
+            if self.progress >= 1.0:
+                self.hold_start = None
+                self.progress = 0.0
+                return True
+        else:
+            self.hold_start = None
+            self.progress = 0.0
+        return False
+
+
+# ── State Machine Debouncer ──────────────────────────────────────────────────
+
+class GestureStateMachine:
+    """Smart state machine debouncer: 8 frame confirmation window + 1.5s cooldown."""
+
+    IDLE = "IDLE"
+    DETECTING = "DETECTING"
+    CONFIRMED = "CONFIRMED"
+    COOLDOWN = "COOLDOWN"
+
+    def __init__(self, required_frames: int = 8, cooldown_s: float = 1.5):
+        self.state = self.IDLE
+        self.current_gesture: Optional[str] = None
+        self.frame_count = 0
+        self.required_frames = required_frames
+        self.cooldown_s = cooldown_s
+        self.cooldown_until: float = 0.0
+        self.last_fired: Optional[str] = None
+
+    def process(self, detected_gesture: Optional[str]) -> Optional[str]:
+        now = time.time()
+
+        if self.state == self.COOLDOWN:
+            if now >= self.cooldown_until:
+                self.state = self.IDLE
+                self.current_gesture = None
+                self.frame_count = 0
+            else:
+                return None
+
+        if detected_gesture is None:
+            self.state = self.IDLE
+            self.current_gesture = None
+            self.frame_count = 0
+            return None
+
+        if detected_gesture != self.current_gesture:
+            self.current_gesture = detected_gesture
+            self.frame_count = 1
+            self.state = self.DETECTING
+            return None
+
+        if self.state == self.DETECTING:
+            self.frame_count += 1
+            if self.frame_count >= self.required_frames:
+                self.state = self.COOLDOWN
+                self.cooldown_until = now + self.cooldown_s
+                self.last_fired = detected_gesture
+                return detected_gesture
+
+        return None
+
+
+# ── Smooth Zoom Controller ───────────────────────────────────────────────────
+
+class GestureZoomController:
+    """Smooth zoom controller with range 0.5x–3.0x and clamped per-frame step."""
+
+    def __init__(self):
+        self.current_zoom = 1.0
+        self.target_zoom = 1.0
+        self.min_zoom = 0.5
+        self.max_zoom = 3.0
+        self.smooth_factor = 0.15
+
+    def set_pinch_distance(self, distance: float, reference_distance: float) -> None:
+        if reference_distance <= 0.0:
+            reference_distance = 0.1
+        ratio = distance / reference_distance
+        self.target_zoom = max(self.min_zoom, min(self.max_zoom, ratio))
+
+    def update(self) -> float:
+        delta = (self.target_zoom - self.current_zoom) * self.smooth_factor
+        # Clamp per-frame delta to ensure smooth visual transition (no jump > 0.10x)
+        delta = max(-0.095, min(0.095, delta))
+        self.current_zoom += delta
+        return self.current_zoom
+
+
+# ── Dedicated Gesture Engine Thread ──────────────────────────────────────────
+
+class GestureEngine(threading.Thread):
+    """
+    Dedicated 30 FPS background engine for webcam acquisition and hand gesture recognition.
+    Decoupled via queues from UI and audio threads.
+    """
+
+    def __init__(self, player=None):
+        super().__init__(daemon=True, name="ARC-GestureEngine")
+        self.player = player
+        self.cap = None
+        self.hands = None
+        self.mp_drawing = None
+        self.mp_hands = None
+        self.running = False
+        self.camera_enabled = True
+        self.flip_horizontal = True
+        self.brightness_offset = 0
+
+        self.gesture_queue: Queue[str] = Queue(maxsize=10)
+        self.frame_queue: Queue[Any] = Queue(maxsize=3)
+
+        self.fps_target = 30
+        self.frame_time = 1.0 / float(self.fps_target)
+
+        self.state_machine = GestureStateMachine(required_frames=8, cooldown_s=1.5)
+        self.hold_detector = GestureHoldDetector("FIST", hold_duration_s=1.0)
+        self.zoom_controller = GestureZoomController()
+
+        self.last_gesture = "None"
+        self.last_confidence = 0.0
+        self.last_latency_ms = 0.0
+        self.active_hands = 0
+        self.active_landmarks = 0
+        self.history: list[dict] = []  # last 5 gestures
+        self.current_fps = 30.0
+        self._prev_hand_dist: Optional[float] = None
+        self._prev_frame_t = time.time()
+
+        self.on_gesture_callback: Optional[Callable[[str], None]] = None
+        self.on_frame_callback: Optional[Callable[[bytes], None]] = None
+        self.on_stats_callback: Optional[Callable[[dict], None]] = None
+
+    def start_engine(self) -> Tuple[bool, str]:
+        if self.running and self.is_alive():
+            return True, "GestureEngine is already active."
+        self.running = True
+        self.start()
+        return True, "GestureEngine active at 30 FPS."
+
+    def stop_engine(self) -> Tuple[bool, str]:
+        self.running = False
+        if self.is_alive() and threading.current_thread() != self:
+            self.join(timeout=2.0)
+        return True, "GestureEngine stopped."
+
+    def run(self) -> None:
+        self._init_mediapipe()
+        self._init_camera()
+
+        while self.running:
+            t0 = time.time()
+            self._process_frame()
+            elapsed = time.time() - t0
+            sleep_time = self.frame_time - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        self._cleanup()
+
+    def _init_mediapipe(self) -> None:
+        try:
+            import mediapipe as mp
+            if hasattr(mp, "solutions") and hasattr(mp.solutions, "hands"):
+                self.mp_hands = mp.solutions.hands
+                self.hands = self.mp_hands.Hands(
+                    static_image_mode=False,
+                    max_num_hands=2,
+                    min_detection_confidence=0.8,
+                    min_tracking_confidence=0.75,
+                    model_complexity=0,  # Fastest model
+                )
+            if hasattr(mp, "solutions") and hasattr(mp.solutions, "drawing_utils"):
+                self.mp_drawing = mp.solutions.drawing_utils
+        except Exception as e:
+            print(f"[GestureEngine] MediaPipe init note: {e}")
+
+    def _init_camera(self) -> None:
+        if not _CV2_AVAILABLE:
+            return
+        try:
+            from core.device_service import get_active_camera_index
+            cam_idx = get_active_camera_index()
+        except Exception:
+            cam_idx = 0
+
+        try:
+            backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+            self.cap = cv2.VideoCapture(cam_idx, backend)
+            if not self.cap.isOpened() and backend != cv2.CAP_ANY:
+                self.cap = cv2.VideoCapture(cam_idx)
+            if self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_FPS, 30)
+        except Exception as e:
+            print(f"[GestureEngine] Camera open note: {e}")
+
+    def _cleanup(self) -> None:
+        if self.hands is not None:
+            try:
+                self.hands.close()
+            except Exception:
+                pass
+            self.hands = None
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+    def _process_frame(self) -> None:
+        now = time.time()
+        dt = now - self._prev_frame_t
+        if dt > 0:
+            self.current_fps = round(1.0 / dt, 1)
+        self._prev_frame_t = now
+
+        frame = None
+        if self.cap is not None and self.cap.isOpened() and self.camera_enabled:
+            try:
+                ret, raw = self.cap.read()
+                if ret and raw is not None:
+                    frame = raw
+            except Exception:
+                frame = None
+
+        if frame is None:
+            # Fallback black canvas with status overlay
+            if _CV2_AVAILABLE:
+                import numpy as np
+                frame = np.zeros((240, 320, 3), dtype=np.uint8)
+                cv2.putText(
+                    frame,
+                    "CAMERA STANDBY" if not self.camera_enabled else "NO FEED",
+                    (60, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 180, 255),
+                    2,
+                )
+            self.active_hands = 0
+            self.active_landmarks = 0
+            self._update_queues(frame, "None", 0.0, 0.0)
+            return
+
+        # Pre-process frame
+        if self.flip_horizontal:
+            frame = cv2.flip(frame, 1)
+        if self.brightness_offset != 0:
+            frame = cv2.convertScaleAbs(frame, alpha=1.0, beta=self.brightness_offset)
+
+        # Scale off-thread before queue or UI transfer
+        frame = cv2.resize(frame, (320, 240))
+
+        # MediaPipe landmark detection
+        t_detect = time.perf_counter()
+        detected_gesture: Optional[str] = None
+        confidence: float = 0.0
+
+        if self.hands is not None:
+            try:
+                try:
+                    from core.gpu_accelerator import get_gpu_accelerator
+                    rgb_frame = get_gpu_accelerator().process_frame_gpu(frame, to_rgb=True)
+                except Exception:
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                results = self.hands.process(rgb_frame)
+                detect_lat = (time.perf_counter() - t_detect) * 1000.0
+                self.last_latency_ms = round(detect_lat, 1)
+
+                if results and results.multi_hand_landmarks:
+                    num_hands = len(results.multi_hand_landmarks)
+                    self.active_hands = num_hands
+                    self.active_landmarks = num_hands * 21
+
+                    # Two hand classification
+                    if num_hands >= 2:
+                        lm_left = results.multi_hand_landmarks[0].landmark
+                        lm_right = results.multi_hand_landmarks[1].landmark
+                        g_two, conf_two, dist = classify_two_hand_gesture(
+                            lm_left, lm_right, self._prev_hand_dist
+                        )
+                        self._prev_hand_dist = dist
+                        if g_two:
+                            detected_gesture = g_two
+                            confidence = conf_two
+                        else:
+                            detected_gesture, confidence = classify_gesture(lm_left)
+
+                    elif num_hands == 1:
+                        lm_single = results.multi_hand_landmarks[0].landmark
+                        detected_gesture, confidence = classify_gesture(lm_single)
+
+                    # Draw green futuristic landmarks, connections and bounding boxes
+                    self._draw_landmarks_overlay(frame, results)
+
+                else:
+                    self.active_hands = 0
+                    self.active_landmarks = 0
+                    self._prev_hand_dist = None
+
+            except Exception as e:
+                self.active_hands = 0
+                self.active_landmarks = 0
+
+        # Debounce and State Machine
+        fired_gesture = self.state_machine.process(detected_gesture)
+
+        # Hold detector for FIST (1.0s hold)
+        if detected_gesture == "FIST":
+            if self.hold_detector.update(True):
+                fired_gesture = "FIST"
+        else:
+            self.hold_detector.update(False)
+
+        # Pinch Zoom update
+        if detected_gesture == "PINCH":
+            self.zoom_controller.set_pinch_distance(0.04, 0.08)
+        elif detected_gesture == "SPREAD":
+            self.zoom_controller.set_pinch_distance(0.20, 0.08)
+        self.zoom_controller.update()
+
+        # Execute gesture if confirmed
+        if fired_gesture:
+            self._on_gesture_fired(fired_gesture)
+
+        self._update_queues(frame, detected_gesture or "None", confidence, self.last_latency_ms)
+
+    def _draw_landmarks_overlay(self, frame: Any, results: Any) -> None:
+        """Renders green futuristic landmark dots, connections, and labels on frame."""
+        h, w, _ = frame.shape
+        if self.mp_drawing is not None and self.mp_hands is not None:
+            for hand_lms in results.multi_hand_landmarks:
+                # MediaPipe green connections and cyan dots
+                self.mp_drawing.draw_landmarks(
+                    frame,
+                    hand_lms,
+                    self.mp_hands.HAND_CONNECTIONS,
+                    self.mp_drawing.DrawingSpec(color=(0, 255, 128), thickness=2, circle_radius=2),
+                    self.mp_drawing.DrawingSpec(color=(0, 220, 100), thickness=2),
+                )
+                # Compute bounding box
+                xs = [int(pt.x * w) for pt in hand_lms.landmark]
+                ys = [int(pt.y * h) for pt in hand_lms.landmark]
+                min_x, max_x = max(0, min(xs) - 8), min(w - 1, max(xs) + 8)
+                min_y, max_y = max(0, min(ys) - 8), min(h - 1, max(ys) + 8)
+                cv2.rectangle(frame, (min_x, min_y), (max_x, max_y), (0, 255, 100), 1)
+
+    def _update_queues(self, frame: Any, gesture: str, confidence: float, latency: float) -> None:
+        self.last_gesture = gesture
+        self.last_confidence = confidence
+
+        # Push frame to queue, dropping old if full
+        if self.frame_queue.full():
+            try:
+                self.frame_queue.get_nowait()
+            except Empty:
+                pass
+        try:
+            self.frame_queue.put_nowait(frame)
+        except Exception:
+            pass
+
+        # Callback for image stream
+        if self.on_frame_callback and frame is not None and _CV2_AVAILABLE:
+            try:
+                _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                self.on_frame_callback(buf.tobytes())
+            except Exception:
+                pass
+
+        if self.on_stats_callback:
+            try:
+                self.on_stats_callback({
+                    "fps": self.current_fps,
+                    "latency_ms": latency,
+                    "hands": self.active_hands,
+                    "landmarks": self.active_landmarks,
+                    "gesture": gesture,
+                    "confidence": confidence,
+                    "frame_progress": self.state_machine.frame_count,
+                    "required_frames": self.state_machine.required_frames,
+                    "hold_progress": self.hold_detector.progress,
+                    "zoom": round(self.zoom_controller.current_zoom, 2),
+                })
+            except Exception:
+                pass
+
+    def _on_gesture_fired(self, gesture: str) -> None:
+        """Dispatches fired gesture action and logs to history."""
+        now_str = time.strftime("%H:%M:%S")
+        action_desc = GESTURES.get(gesture, "Triggered gesture")
+        self.history.append({
+            "time": now_str,
+            "gesture": gesture,
+            "action": action_desc,
+        })
+        if len(self.history) > 5:
+            self.history.pop(0)
+
+        # Push to gesture queue
+        if self.gesture_queue.full():
+            try:
+                self.gesture_queue.get_nowait()
+            except Empty:
+                pass
+        try:
+            self.gesture_queue.put_nowait(gesture)
+        except Exception:
+            pass
+
+        if self.on_gesture_callback:
+            try:
+                self.on_gesture_callback(gesture)
+            except Exception:
+                pass
+
+        self._execute_action(gesture)
+
+    def _execute_action(self, gesture: str) -> None:
+        """Executes corresponding system action for the fired gesture."""
+        try:
+            # G08: THUMBS_UP / G20: BOTH_THUMBS_UP -> Confirm action
+            if gesture in ("THUMBS_UP", "BOTH_THUMBS_UP"):
+                from core.confirm import resolve
+                resolve(True)
+                return
+
+            # G09: THUMBS_DOWN -> Cancel pending action
+            if gesture == "THUMBS_DOWN":
+                from core.confirm import resolve
+                resolve(False)
+                return
+
+            # G07: FIST -> Mute/Unmute microphone
+            if gesture == "FIST":
+                if self.player and hasattr(self.player, "ui") and hasattr(self.player.ui, "_win"):
+                    win = self.player.ui._win
+                    if hasattr(win, "_toggle_mute"):
+                        win._toggle_mute()
+                        return
+                if _PYAUTOGUI:
+                    pyautogui.press("volumemute")
+                return
+
+            # G18: BOTH_OPEN_PALMS -> Emergency stop all active tools
+            if gesture == "BOTH_OPEN_PALMS":
+                if self.player and hasattr(self.player, "interrupt"):
+                    self.player.interrupt()
+                elif self.player and hasattr(self.player, "on_interrupt"):
+                    if callable(self.player.on_interrupt):
+                        self.player.on_interrupt()
+                from core.confirm import resolve
+                resolve(False)
+                return
+
+            # G06: OPEN_PALM -> Pause/Resume listening
+            if gesture == "OPEN_PALM":
+                if self.player and hasattr(self.player, "ui") and hasattr(self.player.ui, "_win"):
+                    win = self.player.ui._win
+                    if hasattr(win, "_tap_wake_manual"):
+                        win._tap_wake_manual()
+                        return
+
+            # G03: PEACE -> Screenshot + analyze screen / Open remote
+            if gesture == "PEACE":
+                if self.player and hasattr(self.player, "open_remote"):
+                    self.player.open_remote()
+                elif self.player and hasattr(self.player, "ui") and hasattr(self.player.ui, "open_remote"):
+                    self.player.ui.open_remote()
+                return
+
+            # G04: THREE_FINGERS -> Show QR code dashboard
+            if gesture == "THREE_FINGERS":
+                if self.player and hasattr(self.player, "open_remote"):
+                    self.player.open_remote()
+                return
+
+            # G05: FOUR_FINGERS -> Open settings drawer
+            if gesture == "FOUR_FINGERS":
+                if self.player and hasattr(self.player, "ui") and hasattr(self.player.ui, "_win"):
+                    win = self.player.ui._win
+                    if hasattr(win, "_toggle_drawer"):
+                        win._toggle_drawer(True)
+                return
+
+            # G01 / G02: Activity scroll
+            if gesture == "INDEX_UP" and _PYAUTOGUI:
+                pyautogui.scroll(120)
+            elif gesture == "INDEX_DOWN" and _PYAUTOGUI:
+                pyautogui.scroll(-120)
+
+            # G12 / G13: Navigation
+            if gesture == "POINT_LEFT" and _PYAUTOGUI:
+                pyautogui.hotkey("ctrl", "win", "left")
+            elif gesture == "POINT_RIGHT" and _PYAUTOGUI:
+                pyautogui.hotkey("ctrl", "win", "right")
+
+        except Exception as e:
+            print(f"[GestureEngine] Execution error for {gesture}: {e}")
+
+
+# ── Gesture Controller Singleton ─────────────────────────────────────────────
+
 class GestureController:
-    """Manages the background gesture recognition thread and state machine."""
+    """Manages the gesture recognition engine and state machine."""
 
     _instance: Optional["GestureController"] = None
     _lock = threading.Lock()
 
     def __init__(self, player=None):
         self.player = player
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._last_hand_time = time.monotonic()
-        self._fps = 30.0
-        self._last_gesture = "None"
-        self._palm_start: Optional[float] = None
-        self._v_sign_start: Optional[float] = None
-        self._last_scroll_y: Optional[float] = None
-        self._last_pinch_dist: Optional[float] = None
-        self._prev_wrist_x: Optional[float] = None
-        self._prev_wrist_time: float = 0.0
-        self._cooldowns: dict[str, float] = {}
+        self.engine = GestureEngine(player)
         self.on_gesture_callback: Optional[Callable[[str], None]] = None
         self.on_frame_callback: Optional[Callable[[bytes], None]] = None
 
@@ -70,10 +809,19 @@ class GestureController:
                 cls._instance = cls(player)
             elif player is not None:
                 cls._instance.player = player
+                cls._instance.engine.player = player
             return cls._instance
 
     def is_running(self) -> bool:
-        return self._running and self._thread is not None and self._thread.is_alive()
+        return self.engine.running and self.engine.is_alive()
+
+    @property
+    def _last_gesture(self) -> str:
+        return self.engine.last_gesture
+
+    @property
+    def history(self) -> list[dict]:
+        return self.engine.history
 
     def start(self) -> Tuple[bool, str]:
         if self.is_running():
@@ -81,24 +829,35 @@ class GestureController:
         if not _CV2_AVAILABLE:
             return False, "OpenCV (cv2) is not installed."
 
-        self._running = True
-        self._thread = threading.Thread(target=self._worker_loop, daemon=True, name="ArcGestureThread")
-        self._thread.start()
+        if self.on_gesture_callback:
+            self.engine.on_gesture_callback = self.on_gesture_callback
+        if self.on_frame_callback:
+            self.engine.on_frame_callback = self.on_frame_callback
 
+        self.engine.start_engine()
         self._notify_hud(True, "Gesture Tracking Active")
         return True, "Gesture control active at 30 FPS. Monitoring webcam for hand gestures."
 
     def stop(self) -> Tuple[bool, str]:
-        if not self._running:
+        if not self.engine.running:
             self._notify_hud(False, "None")
             return True, "Gesture control is not running."
 
-        self._running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-        self._thread = None
+        self.engine.stop_engine()
         self._notify_hud(False, "None")
         return True, "Gesture control stopped."
+
+    def toggle_camera(self) -> bool:
+        self.engine.camera_enabled = not self.engine.camera_enabled
+        return self.engine.camera_enabled
+
+    def toggle_flip(self) -> bool:
+        self.engine.flip_horizontal = not self.engine.flip_horizontal
+        return self.engine.flip_horizontal
+
+    def adjust_brightness(self, delta: int) -> int:
+        self.engine.brightness_offset = max(-100, min(100, self.engine.brightness_offset + delta))
+        return self.engine.brightness_offset
 
     def _notify_hud(self, active: bool, gesture: str = "") -> None:
         g = gesture or self._last_gesture
@@ -122,297 +881,6 @@ class GestureController:
                     self.player.ui.set_gesture_active(active)
         except Exception:
             pass
-
-    def _trigger_cooldown(self, action: str, seconds: float = 1.0) -> bool:
-        now = time.monotonic()
-        last = self._cooldowns.get(action, 0.0)
-        if now - last < seconds:
-            return False
-        self._cooldowns[action] = now
-        return True
-
-    # ── Gesture Actions ──────────────────────────────────────────────────────────
-
-    def _action_zoom(self, delta: float) -> None:
-        if not _PYAUTOGUI or not self._trigger_cooldown("zoom", 0.15):
-            return
-        if delta > 0.03:
-            pyautogui.hotkey("ctrl", "+")
-            self._last_gesture = "Zoom In"
-        elif delta < -0.03:
-            pyautogui.hotkey("ctrl", "-")
-            self._last_gesture = "Zoom Out"
-
-    def _action_scroll(self, dy: float) -> None:
-        if not _PYAUTOGUI or not self._trigger_cooldown("scroll", 0.08):
-            return
-        if dy < -0.015:
-            pyautogui.scroll(120)
-            self._last_gesture = "Scroll Up"
-        elif dy > 0.015:
-            pyautogui.scroll(-120)
-            self._last_gesture = "Scroll Down"
-
-    def _action_mute_toggle(self) -> None:
-        if not self._trigger_cooldown("mute", 2.0):
-            return
-        self._last_gesture = "Mute / Unmute"
-        try:
-            if self.player and hasattr(self.player, "ui") and hasattr(self.player.ui, "_win"):
-                win = self.player.ui._win
-                if hasattr(win, "_toggle_mute"):
-                    win._toggle_mute()
-                    return
-            if _PYAUTOGUI:
-                pyautogui.press("volumemute")
-        except Exception:
-            pass
-
-    def _action_open_remote(self) -> None:
-        if not self._trigger_cooldown("remote", 3.0):
-            return
-        self._last_gesture = "Open Remote QR"
-        try:
-            if self.player and hasattr(self.player, "open_remote"):
-                self.player.open_remote()
-            elif self.player and hasattr(self.player, "ui") and hasattr(self.player.ui, "open_remote"):
-                self.player.ui.open_remote()
-        except Exception:
-            pass
-
-    def _action_swipe(self, direction: str) -> None:
-        if not _PYAUTOGUI or not self._trigger_cooldown("swipe", 1.0):
-            return
-        self._last_gesture = f"Swipe {direction.capitalize()}"
-        if direction == "left":
-            pyautogui.hotkey("ctrl", "win", "left")
-        else:
-            pyautogui.hotkey("ctrl", "win", "right")
-
-    def _action_thumbs_up(self) -> None:
-        if not self._trigger_cooldown("confirm", 2.5):
-            return
-        self._last_gesture = "Thumbs Up (Confirm Gate)"
-        try:
-            from core.confirm import resolve
-            resolve(True)
-        except Exception:
-            pass
-
-    def _action_fist(self) -> None:
-        if not self._trigger_cooldown("cancel", 1.5):
-            return
-        self._last_gesture = "Fist (Cancel / Interrupt)"
-        try:
-            from core.confirm import resolve
-            resolve(False)
-        except Exception:
-            pass
-        try:
-            if self.player and hasattr(self.player, "interrupt"):
-                self.player.interrupt()
-            elif self.player and hasattr(self.player, "on_interrupt"):
-                if callable(self.player.on_interrupt):
-                    self.player.on_interrupt()
-        except Exception:
-            pass
-
-    # ── Landmark Analysis ────────────────────────────────────────────────────────
-
-    def _process_landmarks(self, lm: list[Any], now: float) -> None:
-        """
-        lm is a list of 21 landmarks with .x, .y, .z attributes.
-        0: Wrist
-        4: Thumb tip, 3: IP, 2: MCP
-        8: Index tip, 6: PIP, 5: MCP
-        12: Middle tip, 10: PIP, 9: MCP
-        16: Ring tip, 14: PIP, 13: MCP
-        20: Pinky tip, 18: PIP, 17: MCP
-        """
-        self._last_hand_time = now
-
-        wrist = lm[0]
-        thumb_tip, thumb_mcp = lm[4], lm[2]
-        index_tip, index_pip = lm[8], lm[6]
-        mid_tip, mid_pip = lm[12], lm[10]
-        ring_tip, ring_pip = lm[16], lm[14]
-        pinky_tip, pinky_pip = lm[20], lm[18]
-
-        # Finger extended flags (tip higher than pip in image coordinates where y=0 is top)
-        index_ext = index_tip.y < index_pip.y
-        mid_ext = mid_tip.y < mid_pip.y
-        ring_ext = ring_tip.y < ring_pip.y
-        pinky_ext = pinky_tip.y < pinky_pip.y
-        thumb_up = thumb_tip.y < thumb_mcp.y and thumb_tip.y < index_pip.y
-
-        # Distance function
-        def dist(p1, p2):
-            return math.hypot(p1.x - p2.x, p1.y - p2.y)
-
-        # 1. Thumbs Up: Thumb pointing upward, other 4 fingers curled
-        if thumb_up and not index_ext and not mid_ext and not ring_ext and not pinky_ext:
-            self._action_thumbs_up()
-            return
-
-        # 2. Fist: All 4 main fingers folded + thumb folded across
-        fingers_folded = (not index_ext) and (not mid_ext) and (not ring_ext) and (not pinky_ext)
-        if fingers_folded and dist(thumb_tip, index_pip) < 0.12:
-            self._action_fist()
-            return
-
-        # 3. Mute/Unmute: Open Palm (all 5 fingers extended) held for 1.5s
-        all_extended = index_ext and mid_ext and ring_ext and pinky_ext and (thumb_tip.y < thumb_mcp.y or dist(thumb_tip, wrist) > 0.25)
-        if all_extended:
-            if self._palm_start is None:
-                self._palm_start = now
-            elif now - self._palm_start >= 1.5:
-                self._action_mute_toggle()
-                self._palm_start = None
-        else:
-            self._palm_start = None
-
-        # 4. Trigger QR: Peace / V-sign (Index & Middle extended, Ring & Pinky folded) held for 1.0s
-        v_sign = index_ext and mid_ext and (not ring_ext) and (not pinky_ext)
-        if v_sign:
-            if self._v_sign_start is None:
-                self._v_sign_start = now
-            elif now - self._v_sign_start >= 1.0:
-                self._action_open_remote()
-                self._v_sign_start = None
-        else:
-            self._v_sign_start = None
-
-        # 5. Scroll: Two fingers extended (Index & Middle), tracking vertical motion
-        if v_sign:
-            avg_y = (index_tip.y + mid_tip.y) / 2.0
-            if self._last_scroll_y is not None:
-                dy = avg_y - self._last_scroll_y
-                if abs(dy) > 0.012:
-                    self._action_scroll(dy)
-            self._last_scroll_y = avg_y
-        else:
-            self._last_scroll_y = None
-
-        # 6. Pinch Zoom: Thumb tip and Index tip distance tracking
-        pinch_distance = dist(thumb_tip, index_tip)
-        if not ring_ext and not pinky_ext:
-            if self._last_pinch_dist is not None:
-                ddist = pinch_distance - self._last_pinch_dist
-                if abs(ddist) > 0.025:
-                    self._action_zoom(ddist)
-            self._last_pinch_dist = pinch_distance
-        else:
-            self._last_pinch_dist = None
-
-        # 7. Rapid Swipe Left / Right (wrist horizontal displacement)
-        if self._prev_wrist_x is not None:
-            dt = now - self._prev_wrist_time
-            if 0.02 <= dt <= 0.35:
-                dx = wrist.x - self._prev_wrist_x
-                vx = dx / dt
-                if vx < -1.8:
-                    self._action_swipe("left")
-                    self._prev_wrist_x = None
-                    return
-                elif vx > 1.8:
-                    self._action_swipe("right")
-                    self._prev_wrist_x = None
-                    return
-        self._prev_wrist_x = wrist.x
-        self._prev_wrist_time = now
-
-    # ── Background Worker Loop ───────────────────────────────────────────────────
-
-    def _worker_loop(self) -> None:
-        mp_drawing = None
-
-        try:
-            import mediapipe as mp
-            if hasattr(mp, "solutions"):
-                if hasattr(mp.solutions, "hands"):
-                    mp_hands = mp.solutions.hands
-                    hands_detector = mp_hands.Hands(
-                        static_image_mode=False,
-                        max_num_hands=1,
-                        min_detection_confidence=0.6,
-                        min_tracking_confidence=0.5,
-                    )
-                if hasattr(mp.solutions, "drawing_utils"):
-                    mp_drawing = mp.solutions.drawing_utils
-        except Exception as e:
-            print(f"[GestureControl] MediaPipe initialization note: {e}")
-
-        try:
-            from core.device_service import get_active_camera_index
-            cam_idx = get_active_camera_index()
-            backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-            cap = cv2.VideoCapture(cam_idx, backend)
-            if not cap.isOpened() and backend != cv2.CAP_ANY:
-                cap = cv2.VideoCapture(cam_idx)
-            if not cap.isOpened():
-                print(f"[GestureControl] Webcam {cam_idx} could not be opened. Running in idle state.")
-        except Exception as e:
-            print(f"[GestureControl] VideoCapture error: {e}")
-
-        while self._running:
-            now = time.monotonic()
-
-            # Adaptive FPS: drop to 10 FPS if no hands seen in 5 seconds
-            idle = (now - self._last_hand_time) > 5.0
-            target_interval = 0.10 if idle else (1.0 / 30.0)
-            loop_start = time.monotonic()
-
-            if cap is not None and cap.isOpened():
-                ret, frame = cap.read()
-                if ret and frame is not None:
-                    try:
-                        from core.gpu_accelerator import get_gpu_accelerator
-                        rgb_frame = get_gpu_accelerator().process_frame_gpu(frame, to_rgb=True)
-                    except Exception:
-                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    if hands_detector is not None:
-                        try:
-                            results = hands_detector.process(rgb_frame)
-                            if results and results.multi_hand_landmarks:
-                                self._process_landmarks(results.multi_hand_landmarks[0].landmark, now)
-                                # Draw futuristic HUD landmarks on frame
-                                if mp_drawing is not None and mp_hands is not None:
-                                    try:
-                                        mp_drawing.draw_landmarks(
-                                            frame,
-                                            results.multi_hand_landmarks[0],
-                                            mp_hands.HAND_CONNECTIONS,
-                                            mp_drawing.DrawingSpec(color=(0, 212, 255), thickness=2, circle_radius=2),
-                                            mp_drawing.DrawingSpec(color=(255, 215, 0), thickness=2)
-                                        )
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
-
-                    # Stream annotated frame to UI console if requested
-                    if self.on_frame_callback:
-                        try:
-                            _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
-                            self.on_frame_callback(buf.tobytes())
-                        except Exception:
-                            pass
-
-            elapsed = time.monotonic() - loop_start
-            sleep_time = target_interval - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-        if hands_detector is not None:
-            try:
-                hands_detector.close()
-            except Exception:
-                pass
-        if cap is not None:
-            try:
-                cap.release()
-            except Exception:
-                pass
 
 
 def gesture_control(parameters: dict, player=None, **_context) -> str:
@@ -438,8 +906,7 @@ def gesture_control(parameters: dict, player=None, **_context) -> str:
         return (
             f"Gesture Control Status: {state}.\n"
             f"Last recognized gesture: {last}.\n"
-            "Recognized gestures: Zoom (pinch), Scroll (2-fingers), Mute (open palm 1.5s), "
-            "Remote QR (V-sign 1.0s), Virtual Desktop (swipe), Confirm (thumbs up), Cancel (fist)."
+            f"Active vocabulary: 20 gestures (G01–G20) with 8-frame smart debounce and 1.5s cooldown."
         )
     return f"Unknown action '{action}'. Options: start, stop, toggle, status."
 
@@ -447,9 +914,9 @@ def gesture_control(parameters: dict, player=None, **_context) -> str:
 TOOL = {
     "name": "gesture_control",
     "description": (
-        "Start, stop, or query camera-based hand gesture control. Recognizes zoom in/out (pinch), "
-        "scroll up/down (two fingers), mute (open palm held 1.5s), open remote QR (peace sign held 1.0s), "
-        "switch desktop (horizontal swipe), confirm destructive action (thumbs up), and cancel/interrupt (fist)."
+        "Start, stop, or query camera-based hand gesture control. Recognizes 20 gestures: "
+        "thumbs up/down, open palm, fist (1s hold), peace, pinch, spread, index up/down, "
+        "three/four fingers, OK sign, call me, pointing left/right, and two-hand interactions."
     ),
     "parameters": {
         "type": "OBJECT",

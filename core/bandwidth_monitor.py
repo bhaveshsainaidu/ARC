@@ -202,5 +202,19 @@ def stop_bandwidth_monitor() -> None:
     _stop_event.set()
 
 
+def get_camera_stream_parameters() -> dict:
+    """Returns adaptive camera streaming parameters based on bandwidth state."""
+    state = get_bandwidth_state()
+    if state == HIGH:
+        return {"width": 640, "height": 480, "fps": 30, "quality": 85}
+    elif state == MEDIUM:
+        return {"width": 480, "height": 360, "fps": 25, "quality": 70}
+    elif state == LOW:
+        return {"width": 320, "height": 240, "fps": 15, "quality": 50}
+    else:  # CRITICAL
+        return {"width": 160, "height": 120, "fps": 10, "quality": 35}
+
+
 # Auto-start monitoring thread on import
 start_bandwidth_monitor()
+
