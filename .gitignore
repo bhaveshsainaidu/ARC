@@ -1,0 +1,69 @@
+# ── ARC (Adaptive Real-Time Cognitive Agent) Git Ignore ───────────────────────
+# Fresh clones boot directly to the initial setup screen.
+# Local configurations, machine-specific keys, and runtime logs are never committed.
+
+# ── Secrets & Encrypted Key Stores ──────────────────────────────────────────
+config/api_keys.json
+config/.keyfile
+config/certs/
+config/whatsapp_web/
+config/settings.json
+config/consents.json
+config/speaker_fingerprint.npy
+**/token*.json
+**/client_secret*.json
+*credentials*.json
+.env
+.env.*
+!.env.example
+
+# ── Personal & Episodic Data Stores ─────────────────────────────────────────
+memory/long_term.json
+memory/*.db
+memory/episodes.json
+memory/ethical_audit.json
+memory/pending_tasks.json
+memory/semantic_store.json
+memory/coding_lessons.json
+memory/health/
+memory/notes/
+outputs/
+
+# ── Security Incidents & Quarantine Stores ──────────────────────────────────
+security/incidents/*.md
+!security/incidents/.gitkeep
+security/quarantine/*
+!security/quarantine/.gitkeep
+security/threat_db.json
+
+# ── Python Build & Cache Noise ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+
+# ── Virtual Environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Operating System & Editor Artifacts ─────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Runtime Output & Generated Reports ───────────────────────────────────────
+*.log
+logs/
+downloads/
+screenshots/
+tests/*.html

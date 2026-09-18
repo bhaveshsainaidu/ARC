@@ -1,0 +1,26 @@
+{
+  "team_name": "ARC Core Engineering Team",
+  "members": {
+    "bhavesh": {
+      "name": "Bhavesh",
+      "role": "Founder & Lead Architect",
+      "gender": "male",
+      "personality": "Visionary, technical lead, fast-paced builder, relentless problem-solver driving autonomous AI innovation.",
+      "photo": "memory/faces/bhavesh.jpg"
+    },
+    "teammate_1": {
+      "name": "Teammate 1",
+      "role": "Core Member & Researcher",
+      "gender": "female",
+      "personality": "Analytical, collaborative, creative thinker focusing on design and evaluation.",
+      "photo": "memory/faces/teammate1.jpg"
+    },
+    "teammate_2": {
+      "name": "Teammate 2",
+      "role": "Core Member & Specialist",
+      "gender": "female",
+      "personality": "Strategic, execution-driven, detail-oriented builder.",
+      "photo": "memory/faces/teammate2.jpg"
+    }
+  }
+}
