@@ -389,6 +389,7 @@ class GestureEngine(threading.Thread):
         self.hands = None
         self.mp_drawing = None
         self.mp_hands = None
+        self.tasks_landmarker = None
         self.running = False
         self.camera_enabled = True
         self.flip_horizontal = True
@@ -454,6 +455,7 @@ class GestureEngine(threading.Thread):
         self._cleanup()
 
     def _init_mediapipe(self) -> None:
+        # 1. Try legacy mp.solutions.hands (MediaPipe <= 0.10.14)
         try:
             import mediapipe as mp
             if hasattr(mp, "solutions") and hasattr(mp.solutions, "hands"):
@@ -461,14 +463,45 @@ class GestureEngine(threading.Thread):
                 self.hands = self.mp_hands.Hands(
                     static_image_mode=False,
                     max_num_hands=2,
-                    min_detection_confidence=0.8,
-                    min_tracking_confidence=0.75,
+                    min_detection_confidence=0.7,
+                    min_tracking_confidence=0.7,
                     model_complexity=0,  # Fastest model
                 )
             if hasattr(mp, "solutions") and hasattr(mp.solutions, "drawing_utils"):
                 self.mp_drawing = mp.solutions.drawing_utils
         except Exception as e:
-            print(f"[GestureEngine] MediaPipe init note: {e}")
+            print(f"[GestureEngine] MediaPipe legacy init note: {e}")
+
+        # 2. Try MediaPipe Tasks HandLandmarker (MediaPipe 1.0+ / modern API)
+        if self.hands is None:
+            try:
+                import mediapipe as mp
+                from mediapipe.tasks import python as mp_python
+                from mediapipe.tasks.python import vision
+                from pathlib import Path
+                import urllib.request
+
+                base_dir = Path(__file__).resolve().parent.parent
+                model_dir = base_dir / "models"
+                model_dir.mkdir(parents=True, exist_ok=True)
+                model_path = model_dir / "hand_landmarker.task"
+
+                if not model_path.exists() or model_path.stat().st_size < 1000000:
+                    url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+                    urllib.request.urlretrieve(url, model_path)
+
+                base_options = mp_python.BaseOptions(model_asset_path=str(model_path))
+                options = vision.HandLandmarkerOptions(
+                    base_options=base_options,
+                    running_mode=vision.RunningMode.IMAGE,
+                    num_hands=2,
+                    min_hand_detection_confidence=0.55,
+                    min_tracking_confidence=0.55,
+                )
+                self.tasks_landmarker = vision.HandLandmarker.create_from_options(options)
+                print("[GestureEngine] MediaPipe Tasks HandLandmarker initialized successfully.")
+            except Exception as e:
+                print(f"[GestureEngine] MediaPipe Tasks init note: {e}")
 
     def _init_camera(self) -> None:
         if not _CV2_AVAILABLE:
@@ -496,6 +529,12 @@ class GestureEngine(threading.Thread):
             except Exception:
                 pass
             self.hands = None
+        if getattr(self, "tasks_landmarker", None) is not None:
+            try:
+                self.tasks_landmarker.close()
+            except Exception:
+                pass
+            self.tasks_landmarker = None
         if self.cap is not None:
             try:
                 self.cap.release()
@@ -552,7 +591,7 @@ class GestureEngine(threading.Thread):
         detected_gesture: Optional[str] = None
         confidence: float = 0.0
 
-        if self.hands is not None:
+        if self.hands is not None or getattr(self, "tasks_landmarker", None) is not None:
             try:
                 try:
                     from core.gpu_accelerator import get_gpu_accelerator
@@ -560,19 +599,34 @@ class GestureEngine(threading.Thread):
                 except Exception:
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                results = self.hands.process(rgb_frame)
+                hands_list = []
+                results_obj = None
+
+                if self.hands is not None:
+                    results = self.hands.process(rgb_frame)
+                    results_obj = results
+                    if results and getattr(results, "multi_hand_landmarks", None):
+                        hands_list = [h.landmark for h in results.multi_hand_landmarks]
+                elif getattr(self, "tasks_landmarker", None) is not None:
+                    import mediapipe as mp
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                    res = self.tasks_landmarker.detect(mp_image)
+                    results_obj = res
+                    if res and getattr(res, "hand_landmarks", None):
+                        hands_list = res.hand_landmarks
+
                 detect_lat = (time.perf_counter() - t_detect) * 1000.0
                 self.last_latency_ms = round(detect_lat, 1)
 
-                if results and results.multi_hand_landmarks:
-                    num_hands = len(results.multi_hand_landmarks)
+                if hands_list:
+                    num_hands = len(hands_list)
                     self.active_hands = num_hands
                     self.active_landmarks = num_hands * 21
 
                     # Two hand classification
                     if num_hands >= 2:
-                        lm_left = results.multi_hand_landmarks[0].landmark
-                        lm_right = results.multi_hand_landmarks[1].landmark
+                        lm_left = hands_list[0]
+                        lm_right = hands_list[1]
                         g_two, conf_two, dist = classify_two_hand_gesture(
                             lm_left, lm_right, self._prev_hand_dist
                         )
@@ -584,11 +638,12 @@ class GestureEngine(threading.Thread):
                             detected_gesture, confidence = classify_gesture(lm_left)
 
                     elif num_hands == 1:
-                        lm_single = results.multi_hand_landmarks[0].landmark
+                        lm_single = hands_list[0]
                         detected_gesture, confidence = classify_gesture(lm_single)
 
                     # Draw green futuristic landmarks, connections and bounding boxes
-                    self._draw_landmarks_overlay(frame, results)
+                    if results_obj is not None:
+                        self._draw_landmarks_overlay(frame, results_obj)
 
                 else:
                     self.active_hands = 0
@@ -622,12 +677,21 @@ class GestureEngine(threading.Thread):
 
         self._update_queues(frame, detected_gesture or "None", confidence, self.last_latency_ms)
 
+    HAND_CONNECTIONS = [
+        (0, 1), (1, 2), (2, 3), (3, 4),
+        (0, 5), (5, 6), (6, 7), (7, 8),
+        (0, 9), (9, 10), (10, 11), (11, 12),
+        (0, 13), (13, 14), (14, 15), (15, 16),
+        (0, 17), (17, 18), (18, 19), (19, 20),
+        (5, 9), (9, 13), (13, 17),
+    ]
+
     def _draw_landmarks_overlay(self, frame: Any, results: Any) -> None:
         """Renders green futuristic landmark dots, connections, and labels on frame."""
         h, w, _ = frame.shape
-        if self.mp_drawing is not None and self.mp_hands is not None:
+
+        if self.mp_drawing is not None and self.mp_hands is not None and hasattr(results, "multi_hand_landmarks") and results.multi_hand_landmarks:
             for hand_lms in results.multi_hand_landmarks:
-                # MediaPipe green connections and cyan dots
                 self.mp_drawing.draw_landmarks(
                     frame,
                     hand_lms,
@@ -635,9 +699,46 @@ class GestureEngine(threading.Thread):
                     self.mp_drawing.DrawingSpec(color=(0, 255, 128), thickness=2, circle_radius=2),
                     self.mp_drawing.DrawingSpec(color=(0, 220, 100), thickness=2),
                 )
-                # Compute bounding box
-                xs = [int(pt.x * w) for pt in hand_lms.landmark]
-                ys = [int(pt.y * h) for pt in hand_lms.landmark]
+                xs = [int(getattr(pt, "x", 0.0) * w) for pt in hand_lms.landmark]
+                ys = [int(getattr(pt, "y", 0.0) * h) for pt in hand_lms.landmark]
+                min_x, max_x = max(0, min(xs) - 8), min(w - 1, max(xs) + 8)
+                min_y, max_y = max(0, min(ys) - 8), min(h - 1, max(ys) + 8)
+                cv2.rectangle(frame, (min_x, min_y), (max_x, max_y), (0, 255, 100), 1)
+            return
+
+        # Direct OpenCV rendering compatible with MediaPipe Tasks and custom landmarks
+        hands_list = []
+        if hasattr(results, "multi_hand_landmarks") and results.multi_hand_landmarks:
+            hands_list = results.multi_hand_landmarks
+        elif hasattr(results, "hand_landmarks") and results.hand_landmarks:
+            hands_list = results.hand_landmarks
+        elif isinstance(results, (list, tuple)):
+            hands_list = results
+
+        for hand in hands_list:
+            lms = hand.landmark if hasattr(hand, "landmark") else hand
+            if not lms or len(lms) < 21:
+                continue
+
+            pts = []
+            xs = []
+            ys = []
+            for lm in lms:
+                x, y, _ = _get_xyz(lm)
+                px = max(0, min(w - 1, int(x * w)))
+                py = max(0, min(h - 1, int(y * h)))
+                pts.append((px, py))
+                xs.append(px)
+                ys.append(py)
+
+            for p1, p2 in self.HAND_CONNECTIONS:
+                if p1 < len(pts) and p2 < len(pts):
+                    cv2.line(frame, pts[p1], pts[p2], (0, 255, 128), 2)
+
+            for px, py in pts:
+                cv2.circle(frame, (px, py), 3, (0, 220, 100), -1)
+
+            if xs and ys:
                 min_x, max_x = max(0, min(xs) - 8), min(w - 1, max(xs) + 8)
                 min_y, max_y = max(0, min(ys) - 8), min(h - 1, max(ys) + 8)
                 cv2.rectangle(frame, (min_x, min_y), (max_x, max_y), (0, 255, 100), 1)
@@ -717,9 +818,36 @@ class GestureEngine(threading.Thread):
 
         self._execute_action(gesture)
 
+    def _get_ui_window(self) -> Optional[Any]:
+        """Resolves active Qt MainWindow instance from player reference."""
+        if not self.player:
+            return None
+        if hasattr(self.player, "_toggle_mute") or hasattr(self.player, "_open_remote"):
+            return self.player
+        if hasattr(self.player, "ui"):
+            ui = self.player.ui
+            if hasattr(ui, "_win") and ui._win is not None:
+                return ui._win
+            if hasattr(ui, "_toggle_mute") or hasattr(ui, "_open_remote"):
+                return ui
+        return None
+
+    def _dispatch_ui(self, fn: Callable[[], None]) -> None:
+        """Dispatches widget modification to Qt main thread safely."""
+        try:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(0, fn)
+        except Exception:
+            try:
+                fn()
+            except Exception:
+                pass
+
     def _execute_action(self, gesture: str) -> None:
         """Executes corresponding system action for the fired gesture."""
         try:
+            win = self._get_ui_window()
+
             # G08: THUMBS_UP / G20: BOTH_THUMBS_UP -> Confirm action
             if gesture in ("THUMBS_UP", "BOTH_THUMBS_UP"):
                 from core.confirm import resolve
@@ -734,11 +862,9 @@ class GestureEngine(threading.Thread):
 
             # G07: FIST -> Mute/Unmute microphone
             if gesture == "FIST":
-                if self.player and hasattr(self.player, "ui") and hasattr(self.player.ui, "_win"):
-                    win = self.player.ui._win
-                    if hasattr(win, "_toggle_mute"):
-                        win._toggle_mute()
-                        return
+                if win and hasattr(win, "_toggle_mute"):
+                    self._dispatch_ui(win._toggle_mute)
+                    return
                 if _PYAUTOGUI:
                     pyautogui.press("volumemute")
                 return
@@ -756,33 +882,28 @@ class GestureEngine(threading.Thread):
 
             # G06: OPEN_PALM -> Pause/Resume listening
             if gesture == "OPEN_PALM":
-                if self.player and hasattr(self.player, "ui") and hasattr(self.player.ui, "_win"):
-                    win = self.player.ui._win
-                    if hasattr(win, "_tap_wake_manual"):
-                        win._tap_wake_manual()
+                if win and hasattr(win, "_tap_wake_manual"):
+                    self._dispatch_ui(win._tap_wake_manual)
+                    return
+
+            # G03: PEACE / G04: THREE_FINGERS -> Open remote dashboard / QR code
+            if gesture in ("PEACE", "THREE_FINGERS"):
+                if win:
+                    if hasattr(win, "_open_remote"):
+                        self._dispatch_ui(win._open_remote)
                         return
-
-            # G03: PEACE -> Screenshot + analyze screen / Open remote
-            if gesture == "PEACE":
-                if self.player and hasattr(self.player, "open_remote"):
-                    self.player.open_remote()
-                elif self.player and hasattr(self.player, "ui") and hasattr(self.player.ui, "open_remote"):
-                    self.player.ui.open_remote()
-                return
-
-            # G04: THREE_FINGERS -> Show QR code dashboard
-            if gesture == "THREE_FINGERS":
+                    elif hasattr(win, "open_remote"):
+                        self._dispatch_ui(win.open_remote)
+                        return
                 if self.player and hasattr(self.player, "open_remote"):
                     self.player.open_remote()
                 return
 
             # G05: FOUR_FINGERS -> Open settings drawer
             if gesture == "FOUR_FINGERS":
-                if self.player and hasattr(self.player, "ui") and hasattr(self.player.ui, "_win"):
-                    win = self.player.ui._win
-                    if hasattr(win, "_toggle_drawer"):
-                        win._toggle_drawer(True)
-                return
+                if win and hasattr(win, "_toggle_drawer"):
+                    self._dispatch_ui(lambda: win._toggle_drawer(True))
+                    return
 
             # G01 / G02: Activity scroll
             if gesture == "INDEX_UP" and _PYAUTOGUI:

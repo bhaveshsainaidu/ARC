@@ -67,3 +67,4 @@ logs/
 downloads/
 screenshots/
 tests/*.html
+models/*.task

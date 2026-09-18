@@ -78,11 +78,8 @@ def list_connected_cameras() -> List[Dict[str, Any]]:
 
     active_idx = get_active_camera_index()
 
-    for idx in range(6):
+    for idx in range(3):
         cap = cv2.VideoCapture(idx, backend)
-        if not cap.isOpened() and backend != cv2.CAP_ANY:
-            cap = cv2.VideoCapture(idx)
-
         if cap.isOpened():
             ret, frame = cap.read()
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
