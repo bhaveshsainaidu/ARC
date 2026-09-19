@@ -35,8 +35,16 @@ try:
 except Exception:
     pass
 
-BASE_DIR    = Path(__file__).resolve().parent.parent
-STATIC_DIR  = Path(__file__).parent / "static"
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+
+STATIC_DIR = Path(__file__).parent / "static"
+if not STATIC_DIR.exists() and hasattr(sys, "_MEIPASS"):
+    STATIC_DIR = Path(sys._MEIPASS) / "dashboard" / "static"
+elif not STATIC_DIR.exists():
+    STATIC_DIR = BASE_DIR / "dashboard" / "static"
 PORT        = 8000
 MAX_UPLOAD_MB = 500
 

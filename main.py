@@ -152,7 +152,10 @@ def _get_api_key() -> str:
 
 def _load_system_prompt() -> str:
     try:
-        return PROMPT_PATH.read_text(encoding="utf-8")
+        p = PROMPT_PATH
+        if not p.exists() and hasattr(sys, "_MEIPASS"):
+            p = Path(sys._MEIPASS) / "core" / "prompt.txt"
+        return p.read_text(encoding="utf-8")
     except Exception:
         return (
             "You are ARC, an Adaptive Real-time Cognitive Agent. "
@@ -454,14 +457,21 @@ class ArcLive:
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
 
-        _base_dir = Path(__file__).resolve().parent
+        _act_dir = BASE_DIR / "actions"
+        if not _act_dir.exists() and hasattr(sys, "_MEIPASS"):
+            _act_dir = Path(sys._MEIPASS) / "actions"
+
+        _plug_dir = BASE_DIR / "plugins"
+        if not _plug_dir.exists() and hasattr(sys, "_MEIPASS"):
+            _plug_dir = Path(sys._MEIPASS) / "plugins"
+
         _inline_names = {t["name"] for t in TOOL_DECLARATIONS}
 
         # File-backed tools: every actions/*.py with a TOOL dict, discovered the
         # same way plugins are. Reserved names = the inline tools above, so an
         # action can never shadow one.
         self._action_registry = discover_actions(
-            actions_dir=_base_dir / "actions",
+            actions_dir=_act_dir,
             reserved_names=_inline_names,
             logger=lambda msg: print(f"[Actions] {msg}"),
         )
@@ -469,7 +479,7 @@ class ArcLive:
         # Plugins must not collide with either an inline tool or a discovered action.
         _core_names = _inline_names | self._action_registry.names()
         self._plugin_registry = discover_plugins(
-            plugins_dir=_base_dir / "plugins",
+            plugins_dir=_plug_dir,
             core_tool_names=_core_names,
             logger=lambda msg: print(f"[Plugins] {msg}"),
         )

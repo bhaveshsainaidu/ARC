@@ -481,10 +481,19 @@ class GestureEngine(threading.Thread):
                 from pathlib import Path
                 import urllib.request
 
-                base_dir = Path(__file__).resolve().parent.parent
+                if getattr(sys, "frozen", False):
+                    base_dir = Path(sys.executable).parent
+                else:
+                    base_dir = Path(__file__).resolve().parent.parent
+
                 model_dir = base_dir / "models"
-                model_dir.mkdir(parents=True, exist_ok=True)
                 model_path = model_dir / "hand_landmarker.task"
+                if not model_path.exists() and hasattr(sys, "_MEIPASS"):
+                    mei_path = Path(sys._MEIPASS) / "models" / "hand_landmarker.task"
+                    if mei_path.exists():
+                        model_path = mei_path
+                else:
+                    model_dir.mkdir(parents=True, exist_ok=True)
 
                 if not model_path.exists() or model_path.stat().st_size < 1000000:
                     url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
@@ -503,24 +512,29 @@ class GestureEngine(threading.Thread):
             except Exception as e:
                 print(f"[GestureEngine] MediaPipe Tasks init note: {e}")
 
+    _CAM_LOCK = threading.Lock()
+
     def _init_camera(self) -> None:
-        if not _CV2_AVAILABLE:
+        if not self.camera_enabled:
             return
+
+        cam_idx = 0
         try:
-            from core.device_service import get_active_camera_index
-            cam_idx = get_active_camera_index()
+            from core.device_service import get_selected_camera
+            cam_idx = get_selected_camera()
         except Exception:
             cam_idx = 0
 
-        try:
-            backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
-            self.cap = cv2.VideoCapture(cam_idx, backend)
-            if not self.cap.isOpened() and backend != cv2.CAP_ANY:
-                self.cap = cv2.VideoCapture(cam_idx)
-            if self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_FPS, 30)
-        except Exception as e:
-            print(f"[GestureEngine] Camera open note: {e}")
+        with GestureEngine._CAM_LOCK:
+            try:
+                backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+                self.cap = cv2.VideoCapture(cam_idx, backend)
+                if not self.cap.isOpened() and backend != cv2.CAP_ANY:
+                    self.cap = cv2.VideoCapture(cam_idx)
+                if self.cap.isOpened():
+                    self.cap.set(cv2.CAP_PROP_FPS, 30)
+            except Exception as e:
+                print(f"[GestureEngine] Camera open note: {e}")
 
     def _cleanup(self) -> None:
         if self.hands is not None:
@@ -535,12 +549,13 @@ class GestureEngine(threading.Thread):
             except Exception:
                 pass
             self.tasks_landmarker = None
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-            self.cap = None
+        with GestureEngine._CAM_LOCK:
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
 
     def _process_frame(self) -> None:
         now = time.time()
@@ -969,10 +984,10 @@ class GestureController:
         if not _CV2_AVAILABLE:
             return False, "OpenCV (cv2) is not installed."
 
-        # If engine was previously started, threading.Thread cannot be restarted.
-        # Instantiate a fresh GestureEngine preserving camera settings, callbacks & history.
-        if getattr(self.engine, "_has_started", False) or (getattr(self.engine, "ident", None) is not None and not self.engine.is_alive()):
+        if getattr(self.engine, "_has_started", False) or getattr(self.engine, "ident", None) is not None:
             prev = self.engine
+            if prev.is_alive():
+                prev.stop_engine()
             self.engine = GestureEngine(self.player)
             self.engine.camera_enabled = prev.camera_enabled
             self.engine.flip_horizontal = prev.flip_horizontal

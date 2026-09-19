@@ -40,11 +40,8 @@ try:
 except Exception:
     _WATCHDOG_AVAILABLE = False
 
-try:
-    import scapy.all as scapy_all
-    _SCAPY_AVAILABLE = True
-except Exception:
-    _SCAPY_AVAILABLE = False
+# scapy removed to save 65MB RAM and prevent libpcap warning
+_SCAPY_AVAILABLE = False
 
 try:
     import win32evtlog
